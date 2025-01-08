@@ -1,0 +1,11 @@
+numpy
+scipy
+pandas
+plotly
+streamlit
+statsmodels
+statsforecast
+stqdm
+openpyxl
+darts
+

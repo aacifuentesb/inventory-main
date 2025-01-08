@@ -1,0 +1,2 @@
+- [ ] Comenzar a correr desde hoy, para la primera semana
+- [ ] En Management dashboard separar el stockout cost del revenue breakdown, dejarlo como métrica separada para no sesgar el profit
