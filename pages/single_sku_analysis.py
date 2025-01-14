@@ -28,8 +28,7 @@ from tabs.tab_management import display_management
 from tabs.tab_montecarlo_sim import display_montecarlo_sim
 from tabs.tab_optimization import display_optimization
 
-warnings.filterwarnings("ignore")
-st.set_page_config(layout="wide", page_title="Inventory Management System", page_icon="📦")
+st.set_page_config(layout="wide", page_title="Single SKU Analysis", page_icon="📦")
 
 # Initialize session state
 if 'initialized' not in st.session_state:

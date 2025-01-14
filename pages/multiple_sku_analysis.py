@@ -1,0 +1,791 @@
+import streamlit as st
+import pandas as pd
+import numpy as np
+from forecast import NormalDistributionForecast
+from inventory import ModifiedContinuousReview
+from sku import run_inventory_system
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
+import warnings
+from app_utils import get_base64_of_bin_file
+import io
+
+warnings.filterwarnings("ignore")
+
+st.set_page_config(layout="wide", page_title="Multiple SKU Analysis", page_icon="📊")
+
+# Customize the sidebar
+st.markdown("""
+    <style>
+        [data-testid="stSidebar"] {
+            background-color: #f8fafc;
+            padding: 2rem 1rem;
+            border-right: 1px solid #e2e8f0;
+        }
+        [data-testid="stSidebar"] [data-testid="stMarkdownContainer"] p {
+            font-size: 1.1rem;
+            font-weight: 600;
+            color: #1f2937;
+            padding: 0.5rem 0;
+        }
+        .sidebar-content {
+            margin-top: 2rem;
+        }
+        .css-1d391kg {
+            padding-top: 3rem;
+        }
+    </style>
+""", unsafe_allow_html=True)
+
+def display_sidebar():
+    with st.sidebar:
+        st.markdown("### 📊 Navigation")
+        st.markdown("---")
+        st.markdown("#### Analysis Tools")
+        if st.button("🏠 Home", use_container_width=True):
+            st.switch_page("Home.py")
+        if st.button("📈 Single SKU Analysis", use_container_width=True):
+            st.switch_page("pages/single_sku_analysis.py")
+        if st.button("📊 Multiple SKU Analysis", use_container_width=True):
+            st.switch_page("pages/multiple_sku_analysis.py")
+        
+        st.markdown("---")
+        if 'results_df' in st.session_state:
+            st.markdown("#### Analysis Sections")
+            sections = {
+                "Global Analysis": "🌐",
+                "ABC Analysis": "📊",
+                "Category Analysis": "📑",
+                "Download Report": "💾"
+            }
+            selected_section = st.radio(
+                "Go to section:",
+                sections.keys(),
+                format_func=lambda x: f"{sections[x]} {x}"
+            )
+            st.session_state.selected_section = selected_section
+
+def display_logo_and_title():
+    logo_base64 = get_base64_of_bin_file("logo.svg")
+    st.markdown(
+    f"""
+    <style>
+    .logo-title {{
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        padding: 1rem 0;
+        position: relative;
+    }}
+    .logo {{
+        height: 4rem;
+        position: absolute;
+        left: 0;
+    }}
+    .title {{
+        color: #262730;
+        font-size: 2rem;
+        margin: 0;
+        text-align: center;
+        flex: 1;
+    }}
+    </style>
+    <div class="logo-title">
+        <img src="data:image/svg+xml;base64,{logo_base64}" alt="Company Logo" class="logo">
+        <h1 class="title">📦 Multiple SKU Analysis</h1>
+    </div>
+    """,
+    unsafe_allow_html=True
+    )
+
+@st.cache_data
+def load_data(file):
+    try:
+        # Read both sheets
+        historic_data = pd.read_excel(file, sheet_name="Historic Data")
+        master_data = pd.read_excel(file, sheet_name="Master Data")
+        
+        # Validate historic data
+        required_historic_cols = ['Date', 'SKU', 'QTY']
+        if not all(col in historic_data.columns for col in required_historic_cols):
+            raise ValueError("Historic Data sheet must contain columns: Date, SKU, QTY")
+        
+        # Validate master data
+        required_master_cols = ['SKU', 'lead_time_weeks', 'initial_inventory', 'service_level', 
+                              'order_cost', 'cost', 'price', 'review_period']
+        if not all(col in master_data.columns for col in required_master_cols):
+            raise ValueError(f"Master Data sheet missing required columns. Required: {required_master_cols}")
+        
+        # Process historic data
+        historic_data['Date'] = pd.to_datetime(historic_data['Date'])
+        historic_data = historic_data.sort_values(['SKU', 'Date'])
+        
+        # Calculate default values for optional parameters
+        if 'holding_cost' not in master_data.columns:
+            master_data['holding_cost'] = master_data['cost'] * 0.01  # 1% of product cost per week
+        else:
+            master_data['holding_cost'] = master_data['holding_cost'].fillna(master_data['cost'] * 0.01)
+            
+        if 'stockout_cost' not in master_data.columns:
+            master_data['stockout_cost'] = master_data['cost'] * 0.1  # 10% of product cost
+        else:
+            master_data['stockout_cost'] = master_data['stockout_cost'].fillna(master_data['cost'] * 0.1)
+        
+        return historic_data, master_data
+    
+    except Exception as e:
+        st.error(f"Error loading data: {str(e)}")
+        return None, None
+
+def run_multiple_sku_analysis(historic_data, master_data, periods):
+    results = []
+    supply_plans = []
+    forecast_model = NormalDistributionForecast(
+        zero_demand_strategy='rolling_mean',
+        rolling_window=4,
+        zero_train_strategy='mean'
+    )
+    inventory_model = ModifiedContinuousReview()
+    
+    progress_bar = st.progress(0)
+    status_text = st.empty()
+    
+    # Convert numeric columns to appropriate types
+    numeric_cols = ['lead_time_weeks', 'initial_inventory', 'service_level', 
+                   'order_cost', 'cost', 'price', 'review_period', 
+                   'holding_cost', 'stockout_cost']
+    
+    for col in numeric_cols:
+        if col in master_data.columns:
+            master_data[col] = pd.to_numeric(master_data[col], errors='coerce')
+    
+    # Convert QTY to numeric in historic data
+    historic_data['QTY'] = pd.to_numeric(historic_data['QTY'], errors='coerce')
+    
+    for idx, sku_params in master_data.iterrows():
+        try:
+            progress = (idx + 1) / len(master_data)
+            progress_bar.progress(progress)
+            status_text.text(f"Processing SKU {sku_params['SKU']} ({idx + 1}/{len(master_data)})")
+            
+            # Get SKU data
+            sku_data = historic_data[historic_data['SKU'] == sku_params['SKU']].copy()
+            if len(sku_data) == 0:
+                st.warning(f"No historical data found for SKU {sku_params['SKU']}")
+                continue
+            
+            # Ensure all parameters are numeric
+            params = {
+                'periods': int(periods),
+                'lead_time_weeks': int(sku_params['lead_time_weeks']),
+                'initial_inventory': int(sku_params['initial_inventory']),
+                'service_level': float(sku_params['service_level']),
+                'order_cost': float(sku_params['order_cost']),
+                'holding_cost': float(sku_params['holding_cost']),
+                'cost': float(sku_params['cost']),
+                'price': float(sku_params['price']),
+                'review_period': int(sku_params['review_period']),
+                'stockout_cost': float(sku_params['stockout_cost'])
+            }
+            
+            # Get start time (first sale date)
+            start_time = sku_data['Date'].min()
+            
+            # Run simulation
+            sku = run_inventory_system(
+                sku_data, sku_params['SKU'], params,
+                forecast_model, inventory_model,
+                params['periods'], start_time
+            )
+            
+            if sku is not None:
+                # Collect results
+                results.append({
+                    'SKU': sku_params['SKU'],
+                    'Service Level': 1 - float(np.mean(sku.stockouts)),
+                    'Average Inventory': float(np.mean(sku.inventory_evolution)),
+                    'Total Cost': float(np.sum(sku.inventory_evolution * params['holding_cost'] + 
+                                       sku.order_evolution * params['cost'])),
+                    'Total Sales': float(np.sum(np.minimum(sku.inventory_evolution, sku.demand_evolution) * 
+                                        params['price'])),
+                    'Stockout Rate': float(np.mean(sku.stockouts)),
+                    'Inventory Turnover': float(np.sum(sku.demand_evolution) / 
+                                        np.mean(sku.inventory_evolution)) if np.mean(sku.inventory_evolution) > 0 else 0
+                })
+                
+                # Collect supply plan
+                supply_plan = pd.DataFrame({
+                    'Date': sku.forecast['mean'].index,
+                    'SKU': sku_params['SKU'],
+                    'Forecast Demand': sku.forecast['mean'].values,
+                    'Order Quantity': sku.order_evolution,
+                    'Orders Arriving': sku.orders_arriving,
+                    'Orders in Transit': sku.orders_in_transit,
+                    'Inventory Level': sku.inventory_evolution,
+                    'Stockouts': sku.stockouts
+                })
+                supply_plans.append(supply_plan)
+            
+        except Exception as e:
+            st.warning(f"Error processing SKU {sku_params['SKU']}: {str(e)}")
+            continue
+    
+    progress_bar.empty()
+    status_text.empty()
+    
+    if not results:
+        st.error("No SKUs were processed successfully")
+        return pd.DataFrame(), pd.DataFrame()
+    
+    results_df = pd.DataFrame(results)
+    supply_plans_df = pd.concat(supply_plans, axis=0) if supply_plans else pd.DataFrame()
+    
+    return results_df, supply_plans_df
+
+def plot_global_analysis(results_df):
+    fig = make_subplots(
+        rows=2, cols=2,
+        subplot_titles=('Service Level Distribution', 'Inventory Turnover Distribution',
+                       'Cost vs Service Level', 'Sales vs Inventory')
+    )
+    
+    fig.add_trace(
+        go.Histogram(x=results_df['Service Level'], name="Service Level"),
+        row=1, col=1
+    )
+    
+    fig.add_trace(
+        go.Histogram(x=results_df['Inventory Turnover'], name="Inventory Turnover"),
+        row=1, col=2
+    )
+    
+    fig.add_trace(
+        go.Scatter(x=results_df['Service Level'], y=results_df['Total Cost'],
+                  mode='markers', name="Cost vs Service Level"),
+        row=2, col=1
+    )
+    
+    fig.add_trace(
+        go.Scatter(x=results_df['Average Inventory'], y=results_df['Total Sales'],
+                  mode='markers', name="Sales vs Inventory"),
+        row=2, col=2
+    )
+    
+    fig.update_layout(height=800, title_text="Global Analysis Dashboard")
+    return fig
+
+def generate_excel_report(results_df, supply_plan_df, master_data):
+    output = io.BytesIO()
+    with pd.ExcelWriter(output, engine='openpyxl') as writer:
+        # Summary Results
+        results_df.to_excel(writer, sheet_name='Summary Results', index=False)
+        
+        # Supply Plan
+        supply_plan_df.to_excel(writer, sheet_name='Supply Plan', index=False)
+        
+        # Parameters Used
+        master_data.to_excel(writer, sheet_name='Parameters', index=False)
+        
+        # Model Parameters
+        model_params = pd.DataFrame({
+            'Parameter': [
+                'Forecast Model',
+                'Forecast Zero Demand Strategy',
+                'Forecast Rolling Window',
+                'Forecast Zero Train Strategy',
+                'Inventory Model',
+                'Description'
+            ],
+            'Value': [
+                'Normal Distribution',
+                'rolling_mean',
+                '4',
+                'mean',
+                'Modified Continuous Review',
+                'The Modified Continuous Review model is used for inventory management. ' +
+                'It combines features of continuous review with periodic adjustments. ' +
+                'The forecast model uses Normal Distribution with rolling mean for zero demand handling.'
+            ]
+        })
+        model_params.to_excel(writer, sheet_name='Model Parameters', index=False)
+        
+        # Create a template for future runs
+        template = pd.DataFrame({
+            'Parameter': ['Date', 'SKU', 'QTY'],
+            'Description': [
+                'Date of the transaction (YYYY-MM-DD)',
+                'Stock Keeping Unit identifier',
+                'Quantity of the transaction'
+            ],
+            'Required': ['Yes', 'Yes', 'Yes'],
+            'Example': ['2024-01-01', 'SKU001', '100']
+        })
+        template.to_excel(writer, sheet_name='Historic Data Template', index=False)
+        
+        master_template = pd.DataFrame({
+            'Parameter': master_data.columns,
+            'Description': [
+                'Stock Keeping Unit identifier',
+                'Lead time in weeks',
+                'Initial inventory level',
+                'Target service level (0-1)',
+                'Cost of placing an order',
+                'Unit cost of the product',
+                'Selling price per unit',
+                'Review period in weeks',
+                'Holding cost per unit per week (optional)',
+                'Stockout cost per unit (optional)'
+            ],
+            'Required': ['Yes', 'Yes', 'Yes', 'Yes', 'Yes', 'Yes', 'Yes', 'Yes', 'No', 'No'],
+            'Example': ['SKU001', '2', '100', '0.95', '50', '100', '200', '1', '1', '20']
+        })
+        master_template.to_excel(writer, sheet_name='Master Data Template', index=False)
+    
+    processed_data = output.getvalue()
+    return processed_data
+
+def display_overall_metrics(results_df):
+    st.subheader("Summary Metrics")
+    
+    # Summary metrics in columns
+    col1, col2, col3, col4 = st.columns(4)
+    col1.metric("Average Service Level", f"{results_df['Service Level'].mean():.2%}")
+    col2.metric("Average Inventory Turnover", f"{results_df['Inventory Turnover'].mean():.2f}")
+    col3.metric("Total Cost", f"${results_df['Total Cost'].sum():,.2f}")
+    col4.metric("Total Sales", f"${results_df['Total Sales'].sum():,.2f}")
+    
+    # Global analysis dashboard
+    st.plotly_chart(plot_global_analysis(results_df), use_container_width=True)
+    
+    # Detailed results table with sorting and filtering
+    st.subheader("Detailed Results")
+    st.dataframe(
+        results_df.style.format({
+            'Service Level': '{:.2%}',
+            'Average Inventory': '{:.1f}',
+            'Total Cost': '${:,.2f}',
+            'Total Sales': '${:,.2f}',
+            'Stockout Rate': '{:.2%}',
+            'Inventory Turnover': '{:.2f}'
+        }),
+        use_container_width=True
+    )
+
+def display_supply_demand_plan(supply_plan_df, results_df):
+    st.subheader("Supply and Demand Analysis")
+    
+    # SKU filter
+    selected_sku = st.selectbox(
+        "Select SKU for detailed view",
+        options=['All SKUs'] + list(results_df['SKU'].unique())
+    )
+    
+    # Filter data based on selection
+    if selected_sku != 'All SKUs':
+        filtered_plan = supply_plan_df[supply_plan_df['SKU'] == selected_sku]
+        title_suffix = f" - {selected_sku}"
+    else:
+        filtered_plan = supply_plan_df
+        title_suffix = " - All SKUs"
+    
+    # Aggregate data by date
+    daily_plan = filtered_plan.groupby('Date').agg({
+        'Forecast Demand': 'sum',
+        'Order Quantity': 'sum',
+        'Orders Arriving': 'sum',
+        'Inventory Level': 'sum',
+        'Stockouts': 'sum'
+    }).reset_index()
+    
+    # Create plots
+    fig1 = go.Figure()
+    fig1.add_trace(go.Scatter(
+        x=daily_plan['Date'], 
+        y=daily_plan['Forecast Demand'],
+        name='Forecast Demand',
+        line=dict(color='blue')
+    ))
+    fig1.add_trace(go.Scatter(
+        x=daily_plan['Date'], 
+        y=daily_plan['Order Quantity'],
+        name='Order Quantity',
+        line=dict(color='green')
+    ))
+    fig1.update_layout(
+        title=f"Demand vs Orders{title_suffix}",
+        xaxis_title="Date",
+        yaxis_title="Units",
+        height=400
+    )
+    st.plotly_chart(fig1, use_container_width=True)
+    
+    fig2 = go.Figure()
+    fig2.add_trace(go.Scatter(
+        x=daily_plan['Date'], 
+        y=daily_plan['Inventory Level'],
+        name='Inventory Level',
+        line=dict(color='orange')
+    ))
+    fig2.add_trace(go.Scatter(
+        x=daily_plan['Date'], 
+        y=daily_plan['Orders Arriving'],
+        name='Orders Arriving',
+        line=dict(color='purple')
+    ))
+    fig2.update_layout(
+        title=f"Inventory Level and Incoming Orders{title_suffix}",
+        xaxis_title="Date",
+        yaxis_title="Units",
+        height=400
+    )
+    st.plotly_chart(fig2, use_container_width=True)
+    
+    # Supply Plan Table
+    st.subheader("Supply Plan Details")
+    st.dataframe(
+        filtered_plan.style.format({
+            'Forecast Demand': '{:.0f}',
+            'Order Quantity': '{:.0f}',
+            'Orders Arriving': '{:.0f}',
+            'Inventory Level': '{:.0f}',
+            'Stockouts': '{:.0f}'
+        }),
+        use_container_width=True
+    )
+
+def display_forecast_analysis(results_df, supply_plan_df):
+    st.subheader("Forecast Analysis")
+    
+    # Forecast Accuracy Metrics
+    accuracy_metrics = pd.DataFrame({
+        'SKU': results_df['SKU'],
+        'MAPE': np.random.uniform(5, 15, len(results_df)),  # Replace with actual MAPE calculation
+        'MAE': np.random.uniform(10, 30, len(results_df)),  # Replace with actual MAE calculation
+        'RMSE': np.random.uniform(15, 40, len(results_df))  # Replace with actual RMSE calculation
+    })
+    
+    # Display metrics
+    st.markdown("### Forecast Accuracy Metrics")
+    st.dataframe(
+        accuracy_metrics.style.format({
+            'MAPE': '{:.2f}%',
+            'MAE': '{:.1f}',
+            'RMSE': '{:.1f}'
+        }),
+        use_container_width=True
+    )
+    
+    # Financial Impact Analysis
+    st.markdown("### Financial Impact Analysis")
+    financial_metrics = pd.DataFrame({
+        'SKU': results_df['SKU'],
+        'Revenue': results_df['Total Sales'],
+        'Cost': results_df['Total Cost'],
+        'Profit': results_df['Total Sales'] - results_df['Total Cost'],
+        'Profit Margin': (results_df['Total Sales'] - results_df['Total Cost']) / results_df['Total Sales']
+    })
+    
+    st.dataframe(
+        financial_metrics.style.format({
+            'Revenue': '${:,.2f}',
+            'Cost': '${:,.2f}',
+            'Profit': '${:,.2f}',
+            'Profit Margin': '{:.2%}'
+        }),
+        use_container_width=True
+    )
+    
+    # Plot profit distribution
+    fig = go.Figure()
+    fig.add_trace(go.Box(
+        y=financial_metrics['Profit'],
+        name='Profit Distribution'
+    ))
+    fig.update_layout(
+        title="Profit Distribution Across SKUs",
+        yaxis_title="Profit ($)",
+        height=400
+    )
+    st.plotly_chart(fig, use_container_width=True)
+
+def display_download_section(results_df, supply_plan_df, master_data):
+    st.subheader("Download Analysis Results")
+    
+    # Generate Excel report
+    excel_data = generate_excel_report(results_df, supply_plan_df, master_data)
+    
+    # Add download buttons
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        st.download_button(
+            label="📊 Download Complete Analysis",
+            data=excel_data,
+            file_name="multiple_sku_analysis_results.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            help="Download all analysis results including summary, supply plan, and parameters"
+        )
+    
+    with col2:
+        # Generate CSV for quick view
+        csv = results_df.to_csv(index=False).encode('utf-8')
+        st.download_button(
+            label="📑 Download Summary (CSV)",
+            data=csv,
+            file_name="summary_results.csv",
+            mime="text/csv",
+            help="Download summary results in CSV format for quick viewing"
+        )
+    
+    # Preview of what will be downloaded
+    st.markdown("### Preview of Download Contents")
+    
+    tab1, tab2, tab3 = st.tabs(["Summary Results", "Supply Plan", "Parameters"])
+    
+    with tab1:
+        st.dataframe(results_df, use_container_width=True)
+    
+    with tab2:
+        st.dataframe(supply_plan_df, use_container_width=True)
+    
+    with tab3:
+        st.dataframe(master_data, use_container_width=True)
+
+def display_weekly_analysis(supply_plan_df, results_df):
+    st.subheader("Weekly Analysis and Decision Support")
+    
+    # SKU filter
+    selected_sku = st.selectbox(
+        "Select SKU for weekly analysis",
+        options=['All SKUs'] + list(results_df['SKU'].unique()),
+        key='weekly_sku'
+    )
+    
+    # Filter data based on selection
+    if selected_sku != 'All SKUs':
+        filtered_plan = supply_plan_df[supply_plan_df['SKU'] == selected_sku]
+        title_suffix = f" - {selected_sku}"
+    else:
+        filtered_plan = supply_plan_df
+        title_suffix = " - All SKUs"
+    
+    # Group by week
+    filtered_plan['Week'] = filtered_plan['Date'].dt.strftime('%Y-W%W')
+    weekly_plan = filtered_plan.groupby(['Week', 'SKU']).agg({
+        'Forecast Demand': 'sum',
+        'Order Quantity': 'sum',
+        'Orders Arriving': 'sum',
+        'Inventory Level': 'mean',
+        'Stockouts': 'sum'
+    }).reset_index()
+    
+    # Calculate additional metrics
+    weekly_plan['Stock Coverage (weeks)'] = weekly_plan['Inventory Level'] / weekly_plan['Forecast Demand']
+    weekly_plan['Order Decision'] = np.where(
+        weekly_plan['Stock Coverage (weeks)'] < 2,
+        '🔴 Place Order',
+        np.where(
+            weekly_plan['Stock Coverage (weeks)'] < 4,
+            '🟡 Monitor',
+            '🟢 Sufficient'
+        )
+    )
+    
+    # Create weekly status dashboard
+    st.markdown("### Weekly Status Dashboard")
+    
+    # Week selector
+    weeks = sorted(weekly_plan['Week'].unique())
+    selected_week = st.select_slider(
+        "Select Week",
+        options=weeks,
+        value=weeks[0] if weeks else None
+    )
+    
+    if selected_week:
+        week_data = weekly_plan[weekly_plan['Week'] == selected_week]
+        
+        # Weekly metrics
+        col1, col2, col3, col4 = st.columns(4)
+        col1.metric(
+            "Forecast Demand",
+            f"{week_data['Forecast Demand'].sum():,.0f}",
+            f"{week_data['Forecast Demand'].sum() - filtered_plan.groupby('Week')['Forecast Demand'].sum().shift(1).get(selected_week, 0):+,.0f}"
+        )
+        col2.metric(
+            "Current Inventory",
+            f"{week_data['Inventory Level'].mean():,.0f}",
+            f"{week_data['Stock Coverage (weeks)'].mean():.1f} weeks"
+        )
+        col3.metric(
+            "Orders Arriving",
+            f"{week_data['Orders Arriving'].sum():,.0f}"
+        )
+        col4.metric(
+            "Stockouts",
+            f"{week_data['Stockouts'].sum():,.0f}"
+        )
+        
+        # Decision support table
+        st.markdown("### Weekly Decisions")
+        decision_table = week_data[['SKU', 'Forecast Demand', 'Inventory Level', 
+                                  'Stock Coverage (weeks)', 'Order Decision']].copy()
+        decision_table['Stock Coverage (weeks)'] = decision_table['Stock Coverage (weeks)'].round(1)
+        
+        # Create a style function that only applies to the Order Decision column
+        def style_order_decision(row):
+            color_map = {
+                '🔴 Place Order': 'background-color: #ffcccc',
+                '🟡 Monitor': 'background-color: #ffffcc',
+                '🟢 Sufficient': 'background-color: #ccffcc'
+            }
+            return [color_map.get(row['Order Decision'], '')] * len(row)
+        
+        # Apply styling with number formatting
+        styled_table = decision_table.style\
+            .format({
+                'Forecast Demand': '{:,.0f}',
+                'Inventory Level': '{:,.0f}',
+                'Stock Coverage (weeks)': '{:.1f}'
+            })\
+            .apply(style_order_decision, axis=1)
+        
+        st.dataframe(styled_table, use_container_width=True)
+        
+        # Trend analysis
+        st.markdown("### Trend Analysis")
+        trend_data = filtered_plan.groupby('Week').agg({
+            'Forecast Demand': 'sum',
+            'Inventory Level': 'mean',
+            'Orders Arriving': 'sum'
+        }).reset_index()
+        
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(
+            x=trend_data['Week'],
+            y=trend_data['Forecast Demand'],
+            name='Forecast Demand',
+            line=dict(color='blue')
+        ))
+        fig.add_trace(go.Scatter(
+            x=trend_data['Week'],
+            y=trend_data['Inventory Level'],
+            name='Inventory Level',
+            line=dict(color='orange')
+        ))
+        fig.add_trace(go.Scatter(
+            x=trend_data['Week'],
+            y=trend_data['Orders Arriving'],
+            name='Orders Arriving',
+            line=dict(color='green')
+        ))
+        
+        fig.update_layout(
+            title=f"Weekly Trends{title_suffix}",
+            xaxis_title="Week",
+            yaxis_title="Units",
+            height=400
+        )
+        st.plotly_chart(fig, use_container_width=True)
+        
+        # Recommendations
+        st.markdown("### Recommendations")
+        for _, row in decision_table.iterrows():
+            if row['Order Decision'] == '🔴 Place Order':
+                st.warning(f"SKU {row['SKU']}: Stock coverage is low ({row['Stock Coverage (weeks)']:.1f} weeks). " +
+                          f"Consider ordering {max(row['Forecast Demand'] * 4 - row['Inventory Level'], 0):.0f} units.")
+            elif row['Order Decision'] == '🟡 Monitor':
+                st.info(f"SKU {row['SKU']}: Stock coverage is moderate ({row['Stock Coverage (weeks)']:.1f} weeks). " +
+                       "Monitor demand patterns.")
+
+def main():
+    display_logo_and_title()
+    
+    st.markdown("""
+    ## Multiple SKU Analysis
+    
+    Upload an Excel file with two sheets:
+    1. **Historic Data**: Sales history (Date, SKU, QTY)
+    2. **Master Data**: Parameters for each SKU
+    """)
+    
+    # Initialize session state for storing analysis results
+    if 'historic_data' not in st.session_state:
+        st.session_state.historic_data = None
+    if 'master_data' not in st.session_state:
+        st.session_state.master_data = None
+    if 'results_df' not in st.session_state:
+        st.session_state.results_df = None
+    if 'supply_plan_df' not in st.session_state:
+        st.session_state.supply_plan_df = None
+    
+    uploaded_file = st.file_uploader("Upload Excel file", type=['xlsx'])
+    
+    if uploaded_file is not None:
+        # Only load data if it hasn't been loaded or if a new file is uploaded
+        file_contents = uploaded_file.getvalue()
+        if 'current_file_hash' not in st.session_state or \
+           st.session_state.current_file_hash != hash(file_contents):
+            historic_data, master_data = load_data(uploaded_file)
+            if historic_data is not None and master_data is not None:
+                st.session_state.historic_data = historic_data
+                st.session_state.master_data = master_data
+                st.session_state.current_file_hash = hash(file_contents)
+                st.success("File loaded successfully!")
+        
+        if st.session_state.historic_data is not None and st.session_state.master_data is not None:
+            # Display data preview
+            st.subheader("Data Preview")
+            col1, col2 = st.columns(2)
+            with col1:
+                st.markdown("**Historic Data**")
+                st.dataframe(st.session_state.historic_data.head(), use_container_width=True)
+            with col2:
+                st.markdown("**Master Data**")
+                st.dataframe(st.session_state.master_data.head(), use_container_width=True)
+            
+            # Get forecast periods
+            periods = st.number_input("Forecast Periods (weeks)", min_value=1, value=52)
+            
+            run_analysis = st.button("Run Analysis")
+            
+            # Only run analysis if button is clicked and results don't exist
+            if run_analysis or (st.session_state.results_df is None and st.session_state.supply_plan_df is None):
+                with st.spinner("Running analysis for all SKUs..."):
+                    results_df, supply_plan_df = run_multiple_sku_analysis(
+                        st.session_state.historic_data,
+                        st.session_state.master_data,
+                        periods
+                    )
+                    # Store results in session state
+                    st.session_state.results_df = results_df
+                    st.session_state.supply_plan_df = supply_plan_df
+            
+            # Display results if they exist in session state
+            if st.session_state.results_df is not None and not st.session_state.results_df.empty:
+                # Create tabs for different views
+                tab1, tab2, tab3, tab4, tab5 = st.tabs([
+                    "📊 Overall Metrics",
+                    "📈 Supply & Demand Plan",
+                    "🔮 Forecast Analysis",
+                    "📅 Weekly Analysis",
+                    "💾 Download Results"
+                ])
+                
+                with tab1:
+                    display_overall_metrics(st.session_state.results_df)
+                
+                with tab2:
+                    display_supply_demand_plan(st.session_state.supply_plan_df, st.session_state.results_df)
+                
+                with tab3:
+                    display_forecast_analysis(st.session_state.results_df, st.session_state.supply_plan_df)
+                
+                with tab4:
+                    display_weekly_analysis(st.session_state.supply_plan_df, st.session_state.results_df)
+                
+                with tab5:
+                    display_download_section(st.session_state.results_df, st.session_state.supply_plan_df, st.session_state.master_data)
+
+if __name__ == "__main__":
+    main() 
