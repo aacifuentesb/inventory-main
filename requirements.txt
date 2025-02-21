@@ -7,5 +7,5 @@ statsmodels
 statsforecast
 stqdm
 openpyxl
-darts
+
 

@@ -9,9 +9,7 @@ from scipy import stats
 from sklearn.metrics import mean_absolute_error, mean_squared_error
 from sklearn.preprocessing import MinMaxScaler
 import warnings
-from darts import TimeSeries
-from darts.dataprocessing.transformers import Scaler
-from darts.utils.likelihood_models import QuantileRegression
+
 
 
 class ForecastModel(ABC):
@@ -363,9 +361,7 @@ class ARIMAForecast(ForecastModel):
 
         The model is fit to the data and used to make forecasts.
         '''
-    
-        
-    
+     
 
 class HoltWintersAdvancedForecast(ForecastModel):
     def forecast(self, data, periods):
@@ -506,7 +502,8 @@ class HoltWintersAdvancedForecast(ForecastModel):
         - Damping: with or without
         Based on the data characteristics.
         '''
-    
+
+
 class SeasonalARIMAForecast(ForecastModel):
     def __init__(self, zero_demand_strategy='rolling_mean', rolling_window=4, 
                  zero_train_strategy='mean', use_mape=True, strip_indices=True):
@@ -598,6 +595,7 @@ class SeasonalARIMAForecast(ForecastModel):
         - Series with trends
         - Medium to long-term forecasting
         '''
+
 
 class EnsembleForecast(ForecastModel):
     def __init__(self, zero_demand_strategy='rolling_mean', rolling_window=4, 
@@ -694,6 +692,7 @@ class EnsembleForecast(ForecastModel):
         - Adds dates only at the end
         '''
 
+
 class MovingAverageTrendForecast(ForecastModel):
     def __init__(self, zero_demand_strategy='rolling_mean', rolling_window=4, 
                  zero_train_strategy='mean', use_mape=True, strip_indices=True):
@@ -753,6 +752,7 @@ class MovingAverageTrendForecast(ForecastModel):
         
         Good for stable demand patterns with gradual trends.
         '''
+
 
 class SimpleExpSmoothingDrift(ForecastModel):
     def __init__(self, zero_demand_strategy='rolling_mean', rolling_window=4, 
@@ -827,6 +827,8 @@ class SimpleExpSmoothingDrift(ForecastModel):
         
         Good for data with both level changes and long-term trends.
         '''
+
+
 class CrostonForecast(ForecastModel):
     def __init__(self, zero_demand_strategy='rolling_mean', rolling_window=4, 
                  zero_train_strategy='mean', use_mape=True, strip_indices=True,

@@ -162,6 +162,8 @@ def run_multiple_sku_analysis(historic_data, master_data, periods):
     # Convert QTY to numeric in historic data
     historic_data['QTY'] = pd.to_numeric(historic_data['QTY'], errors='coerce')
     
+    skipped_skus = []
+    
     for idx, sku_params in master_data.iterrows():
         try:
             progress = (idx + 1) / len(master_data)
@@ -170,8 +172,16 @@ def run_multiple_sku_analysis(historic_data, master_data, periods):
             
             # Get SKU data
             sku_data = historic_data[historic_data['SKU'] == sku_params['SKU']].copy()
+            
+            # Skip if no historical data or less than 2 sales points
             if len(sku_data) == 0:
-                st.warning(f"No historical data found for SKU {sku_params['SKU']}")
+                skipped_skus.append(f"No historical data found for SKU {sku_params['SKU']}")
+                continue
+                
+            # Count non-zero sales points
+            non_zero_sales = len(sku_data[sku_data['QTY'] > 0])
+            if non_zero_sales < 2:
+                skipped_skus.append(f"Insufficient sales data for SKU {sku_params['SKU']} (only {non_zero_sales} sales points)")
                 continue
             
             # Ensure all parameters are numeric
@@ -230,11 +240,17 @@ def run_multiple_sku_analysis(historic_data, master_data, periods):
                 supply_plans.append(supply_plan)
             
         except Exception as e:
-            st.warning(f"Error processing SKU {sku_params['SKU']}: {str(e)}")
+            skipped_skus.append(f"Error processing SKU {sku_params['SKU']}: {str(e)}")
             continue
     
     progress_bar.empty()
     status_text.empty()
+    
+    # Display summary of skipped SKUs if any
+    if skipped_skus:
+        st.warning("Summary of skipped SKUs:")
+        for msg in skipped_skus:
+            st.write(msg)
     
     if not results:
         st.error("No SKUs were processed successfully")
@@ -278,9 +294,64 @@ def plot_global_analysis(results_df):
     return fig
 
 def generate_excel_report(results_df, supply_plan_df, master_data):
+    # Calculate Syntetos-Boylan categories for each SKU
+    categorization_results = []
+    historic_data = st.session_state.historic_data
+    
+    for sku in master_data['SKU']:
+        sku_data = historic_data[historic_data['SKU'] == sku].copy()
+        
+        # Skip if no data
+        if len(sku_data) == 0:
+            categorization_results.append({
+                'SKU': sku,
+                'Category': 'Insufficient Data'
+            })
+            continue
+            
+        # Get non-zero demands
+        non_zero_demands = sku_data[sku_data['QTY'] > 0]['QTY']
+        total_periods = len(sku_data)
+        
+        if len(non_zero_demands) < 2:
+            categorization_results.append({
+                'SKU': sku,
+                'Category': 'Insufficient Data'
+            })
+            continue
+        
+        # Calculate ADI
+        adi = total_periods / len(non_zero_demands)
+        
+        # Calculate CV²
+        cv2 = (non_zero_demands.std() / non_zero_demands.mean()) ** 2
+        
+        # Determine category
+        if adi < 1.32:
+            if cv2 < 0.49:
+                category = 'Smooth'
+            else:
+                category = 'Erratic'
+        else:
+            if cv2 < 0.49:
+                category = 'Intermittent'
+            else:
+                category = 'Lumpy'
+        
+        categorization_results.append({
+            'SKU': sku,
+            'Category': category
+        })
+    
+    # Create DataFrame with categories
+    categories_df = pd.DataFrame(categorization_results)
+    
+    # Merge categories with results
+    results_df = results_df.merge(categories_df, on='SKU', how='left')
+    
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine='openpyxl') as writer:
-        # Summary Results
+        # Summary Results with categories
         results_df.to_excel(writer, sheet_name='Summary Results', index=False)
         
         # Supply Plan
@@ -763,6 +834,183 @@ def display_weekly_analysis(supply_plan_df, results_df):
                 elif '⚠️' in row['Order Decision']:
                     st.warning(f"SKU {row['SKU']}: Unable to calculate stock coverage. Please check forecast and inventory data.")
 
+def display_syntetos_categorization(historic_data, master_data):
+    st.subheader("Syntetos-Boylan Categorization")
+    
+    # Add explanation
+    st.markdown("""
+    ### About Syntetos-Boylan Categorization
+    
+    This categorization helps identify demand patterns based on:
+    
+    - **ADI** (Average Demand Interval): Average time between non-zero demands
+    - **CV²** (Squared Coefficient of Variation): Measures relative variability of non-zero demands
+    
+    Categories:
+    - 🟦 **Smooth**: Regular demand with low variability (ADI < 1.32, CV² < 0.49)
+    - 🟨 **Erratic**: Regular demand with high variability (ADI < 1.32, CV² ≥ 0.49)
+    - 🟩 **Intermittent**: Irregular demand with low variability (ADI ≥ 1.32, CV² < 0.49)
+    - 🟥 **Lumpy**: Irregular demand with high variability (ADI ≥ 1.32, CV² ≥ 0.49)
+    - ⬜ **Insufficient Data**: Less than 2 demand points
+    """)
+    
+    # Calculate metrics for each SKU
+    categorization_results = []
+    
+    for sku in master_data['SKU']:
+        sku_data = historic_data[historic_data['SKU'] == sku].copy()
+        
+        # Skip if no data
+        if len(sku_data) == 0:
+            categorization_results.append({
+                'SKU': sku,
+                'ADI': None,
+                'CV2': None,
+                'Category': 'Insufficient Data',
+                'Non-zero Demands': 0,
+                'Total Periods': 0,
+                'Mean Demand': 0
+            })
+            continue
+            
+        # Get non-zero demands
+        non_zero_demands = sku_data[sku_data['QTY'] > 0]['QTY']
+        total_periods = len(sku_data)
+        
+        if len(non_zero_demands) < 2:
+            categorization_results.append({
+                'SKU': sku,
+                'ADI': None,
+                'CV2': None,
+                'Category': 'Insufficient Data',
+                'Non-zero Demands': len(non_zero_demands),
+                'Total Periods': total_periods,
+                'Mean Demand': non_zero_demands.mean() if len(non_zero_demands) > 0 else 0
+            })
+            continue
+        
+        # Calculate ADI
+        adi = total_periods / len(non_zero_demands)
+        
+        # Calculate CV²
+        cv2 = (non_zero_demands.std() / non_zero_demands.mean()) ** 2
+        
+        # Determine category
+        if adi < 1.32:
+            if cv2 < 0.49:
+                category = 'Smooth'
+            else:
+                category = 'Erratic'
+        else:
+            if cv2 < 0.49:
+                category = 'Intermittent'
+            else:
+                category = 'Lumpy'
+        
+        categorization_results.append({
+            'SKU': sku,
+            'ADI': adi,
+            'CV2': cv2,
+            'Category': category,
+            'Non-zero Demands': len(non_zero_demands),
+            'Total Periods': total_periods,
+            'Mean Demand': non_zero_demands.mean()
+        })
+    
+    # Create DataFrame
+    results_df = pd.DataFrame(categorization_results)
+    
+    # Display summary statistics
+    col1, col2, col3, col4, col5 = st.columns(5)
+    
+    with col1:
+        n_smooth = len(results_df[results_df['Category'] == 'Smooth'])
+        st.metric("🟦 Smooth", n_smooth)
+        
+    with col2:
+        n_erratic = len(results_df[results_df['Category'] == 'Erratic'])
+        st.metric("🟨 Erratic", n_erratic)
+        
+    with col3:
+        n_intermittent = len(results_df[results_df['Category'] == 'Intermittent'])
+        st.metric("🟩 Intermittent", n_intermittent)
+        
+    with col4:
+        n_lumpy = len(results_df[results_df['Category'] == 'Lumpy'])
+        st.metric("🟥 Lumpy", n_lumpy)
+        
+    with col5:
+        n_insufficient = len(results_df[results_df['Category'] == 'Insufficient Data'])
+        st.metric("⬜ Insufficient Data", n_insufficient)
+    
+    # Create scatter plot
+    fig = go.Figure()
+    
+    # Add regions with valid CSS colors
+    fig.add_shape(type="rect", x0=0, x1=1.32, y0=0, y1=0.49,
+                  fillcolor="lightblue", opacity=0.3, line=dict(width=0))
+    fig.add_shape(type="rect", x0=0, x1=1.32, y0=0.49, y1=max(results_df['CV2'].max()*1.1, 2),
+                  fillcolor="lightyellow", opacity=0.3, line=dict(width=0))
+    fig.add_shape(type="rect", x0=1.32, x1=max(results_df['ADI'].max()*1.1, 3), y0=0, y1=0.49,
+                  fillcolor="lightgreen", opacity=0.3, line=dict(width=0))
+    fig.add_shape(type="rect", x0=1.32, x1=max(results_df['ADI'].max()*1.1, 3), y0=0.49, y1=max(results_df['CV2'].max()*1.1, 2),
+                  fillcolor="lightpink", opacity=0.3, line=dict(width=0))
+    
+    # Add points for each category
+    categories = ['Smooth', 'Erratic', 'Intermittent', 'Lumpy']
+    colors = ['royalblue', 'orange', 'forestgreen', 'red']
+    
+    for category, color in zip(categories, colors):
+        mask = results_df['Category'] == category
+        fig.add_trace(go.Scatter(
+            x=results_df[mask]['ADI'],
+            y=results_df[mask]['CV2'],
+            mode='markers',
+            name=category,
+            marker=dict(color=color, size=8),
+            text=results_df[mask]['SKU'],
+            hovertemplate="SKU: %{text}<br>ADI: %{x:.2f}<br>CV²: %{y:.2f}"
+        ))
+    
+    # Add lines for categorization
+    fig.add_shape(type="line", x0=1.32, x1=1.32, y0=0, y1=max(results_df['CV2'].max()*1.1, 2),
+                  line=dict(dash="dash", color="gray"))
+    fig.add_shape(type="line", x0=0, x1=max(results_df['ADI'].max()*1.1, 3), y0=0.49, y1=0.49,
+                  line=dict(dash="dash", color="gray"))
+    
+    fig.update_layout(
+        title="Demand Pattern Categorization",
+        xaxis_title="ADI (Average Demand Interval)",
+        yaxis_title="CV² (Squared Coefficient of Variation)",
+        showlegend=True,
+        height=600
+    )
+    
+    st.plotly_chart(fig, use_container_width=True)
+    
+    # Display detailed results table
+    st.subheader("Detailed Results")
+    
+    # Format the DataFrame for display
+    display_df = results_df.copy()
+    display_df['ADI'] = display_df['ADI'].apply(lambda x: f"{x:.2f}" if pd.notnull(x) else "N/A")
+    display_df['CV2'] = display_df['CV2'].apply(lambda x: f"{x:.2f}" if pd.notnull(x) else "N/A")
+    display_df['Mean Demand'] = display_df['Mean Demand'].apply(lambda x: f"{x:.2f}")
+    
+    # Add color coding for categories
+    def color_category(val):
+        colors = {
+            'Smooth': 'background-color: lightblue',
+            'Erratic': 'background-color: lightyellow',
+            'Intermittent': 'background-color: lightgreen',
+            'Lumpy': 'background-color: lightpink',
+            'Insufficient Data': 'background-color: lightgray'
+        }
+        return colors.get(val, '')
+    
+    styled_df = display_df.style.applymap(color_category, subset=['Category'])
+    st.dataframe(styled_df, use_container_width=True)
+
 def main():
     display_logo_and_title()
     
@@ -783,6 +1031,8 @@ def main():
         st.session_state.results_df = None
     if 'supply_plan_df' not in st.session_state:
         st.session_state.supply_plan_df = None
+    if 'warnings_container' not in st.session_state:
+        st.session_state.warnings_container = None
     
     uploaded_file = st.file_uploader("Upload Excel file", type=['xlsx'])
     
@@ -812,16 +1062,26 @@ def main():
             # Get forecast periods
             periods = st.number_input("Forecast Periods (weeks)", min_value=1, value=52)
             
+            # Create a container for warnings that can be cleared
+            if st.session_state.warnings_container is None:
+                st.session_state.warnings_container = st.empty()
+            
             run_analysis = st.button("Run Analysis")
             
-            # Only run analysis if button is clicked and results don't exist
-            if run_analysis or (st.session_state.results_df is None and st.session_state.supply_plan_df is None):
+            # Only run analysis if button is clicked
+            if run_analysis:
                 with st.spinner("Running analysis for all SKUs..."):
-                    results_df, supply_plan_df = run_multiple_sku_analysis(
-                        st.session_state.historic_data,
-                        st.session_state.master_data,
-                        periods
-                    )
+                    # Clear previous warnings
+                    st.session_state.warnings_container.empty()
+                    
+                    # Create a new container for warnings during this run
+                    with st.session_state.warnings_container.container():
+                        results_df, supply_plan_df = run_multiple_sku_analysis(
+                            st.session_state.historic_data,
+                            st.session_state.master_data,
+                            periods
+                        )
+                    
                     # Store results in session state
                     st.session_state.results_df = results_df
                     st.session_state.supply_plan_df = supply_plan_df
@@ -829,11 +1089,12 @@ def main():
             # Display results if they exist in session state
             if st.session_state.results_df is not None and not st.session_state.results_df.empty:
                 # Create tabs for different views
-                tab1, tab2, tab3, tab4, tab5 = st.tabs([
+                tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
                     "📊 Overall Metrics",
                     "📈 Supply & Demand Plan",
                     "🔮 Forecast Analysis",
                     "📅 Weekly Analysis",
+                    "🎯 Categorization",
                     "💾 Download Results"
                 ])
                 
@@ -850,6 +1111,9 @@ def main():
                     display_weekly_analysis(st.session_state.supply_plan_df, st.session_state.results_df)
                 
                 with tab5:
+                    display_syntetos_categorization(st.session_state.historic_data, st.session_state.master_data)
+                
+                with tab6:
                     display_download_section(st.session_state.results_df, st.session_state.supply_plan_df, st.session_state.master_data)
 
 if __name__ == "__main__":

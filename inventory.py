@@ -480,6 +480,11 @@ class ModifiedContinuousReview(InventoryModel):
             return self._optimize_policy(demand, params)
 
     def _calculate_policy(self, demand, params):
+        # First validate we have enough historical data
+        non_zero_sales = demand[demand > 0]
+        if len(non_zero_sales) < 2:
+            raise ValueError(f"Insufficient historical sales data. Found only {len(non_zero_sales)} non-zero sales points, minimum required is 2.")
+            
         # Existing calculation logic
         annual_demand = np.sum(demand) * (52 / len(demand))
         annual_demand = max(annual_demand, 0.01)
@@ -494,28 +499,43 @@ class ModifiedContinuousReview(InventoryModel):
         protected_period_demand = avg_weekly_demand * protected_period
         protected_period_std = std_weekly_demand * np.sqrt(protected_period)
         
+        # Calculate minimum EOQ based on average weekly demand and review period
+        min_eoq = max(
+            avg_weekly_demand * review_period,  # At least cover review period demand
+            np.ceil(np.percentile(non_zero_sales, 25))  # Use 25th percentile of non-zero sales only
+        )
+        
         if 'eoq' in params:
-            order_quantity = params['eoq']
+            order_quantity = max(params['eoq'], min_eoq)
         else:
             if params['order_cost'] > 0:
                 basic_eoq = np.sqrt((2 * params['order_cost'] * annual_demand) / params['holding_cost'])
-                order_quantity = max(avg_weekly_demand * review_period, 
-                                     avg_weekly_demand * review_period * np.ceil(basic_eoq / (avg_weekly_demand * review_period)))
+                order_quantity = max(
+                    min_eoq,
+                    avg_weekly_demand * review_period * np.ceil(basic_eoq / (avg_weekly_demand * review_period))
+                )
             else:
                 z = stats.norm.ppf(params['service_level'])
-                order_quantity = max(avg_weekly_demand * review_period, z * protected_period_std)
+                order_quantity = max(
+                    min_eoq,
+                    avg_weekly_demand * review_period,
+                    z * protected_period_std
+                )
         
+        # Calculate safety stock first
+        z = stats.norm.ppf(params['service_level'])
+        safety_stock = z * protected_period_std
+        
+        # Then calculate reorder point using the safety stock
         if 'reorder_point' in params:
-            reorder_point = params['reorder_point']
+            reorder_point = max(params['reorder_point'], protected_period_demand)
         else:
-            z = stats.norm.ppf(params['service_level'])
-            safety_stock = z * protected_period_std
-            reorder_point = protected_period_demand + safety_stock
+            reorder_point = protected_period_demand + safety_stock  # ROP = D*L + SS
         
         self.policy = {
-            'eoq': np.round(order_quantity, 2),
+            'eoq': np.round(max(order_quantity, 1), 2),  # Ensure minimum of 1
             'reorder_point': np.round(reorder_point, 2),
-            'safety_stock': np.round(reorder_point - protected_period_demand, 2)
+            'safety_stock': np.round(safety_stock, 2)  # Use the directly calculated safety stock
         }
         
         return self.policy
