@@ -315,6 +315,257 @@ class NormalDistributionForecast(ForecastModel):
         '''
 
 
+class SeasonalNormalDistributionForecast(ForecastModel):
+    def __init__(self, zero_demand_strategy='rolling_mean', rolling_window=4, 
+                 zero_train_strategy='mean', use_mape=True, strip_indices=True,
+                 seasonal_periods=4):  # 4 weeks per month
+        """
+        Initialize Seasonal Normal Distribution forecast model
+        
+        Parameters:
+        -----------
+        seasonal_periods : int
+            Number of weeks to consider as one seasonal cycle (default 4 for monthly)
+        """
+        super().__init__(zero_demand_strategy, rolling_window, 
+                        zero_train_strategy, use_mape, strip_indices)
+        self.seasonal_periods = seasonal_periods
+        self.seasonality_extracted = False  # Track if seasonality was successfully extracted
+
+    def extract_seasonality(self, data):
+        """
+        Extract seasonal patterns from the data
+        
+        Parameters:
+        -----------
+        data : pd.Series
+            Historical time series data
+            
+        Returns:
+        --------
+        seasonal_factors : np.array
+            Seasonal factors for each week in the seasonal cycle
+        """
+        try:
+            print("\nAttempting to extract seasonality...")
+            
+            # Ensure we have enough data for decomposition
+            if len(data) < 2 * self.seasonal_periods:
+                print("Insufficient data for seasonality extraction")
+                self.seasonality_extracted = False
+                return np.ones(self.seasonal_periods)
+            
+            # Handle zeros and missing values
+            data_for_decomp = data.copy()
+            non_zero_mean = data_for_decomp[data_for_decomp > 0].mean()
+            
+            if pd.isna(non_zero_mean) or non_zero_mean == 0:
+                print("No valid non-zero values found")
+                self.seasonality_extracted = False
+                return np.ones(self.seasonal_periods)
+            
+            # Replace zeros with small values
+            small_value = max(non_zero_mean * 0.1, 0.1)
+            data_for_decomp = data_for_decomp.replace(0, small_value)
+            
+            # Ensure all values are finite
+            if not np.all(np.isfinite(data_for_decomp)):
+                print("Data contains infinite values")
+                self.seasonality_extracted = False
+                return np.ones(self.seasonal_periods)
+            
+            print(f"Data range: {data_for_decomp.min():.2f} to {data_for_decomp.max():.2f}")
+            
+            try:
+                # Perform seasonal decomposition with error handling
+                decomposition = seasonal_decompose(
+                    data_for_decomp,
+                    period=self.seasonal_periods,
+                    model='additive'
+                )
+                
+                # Extract seasonal component
+                seasonal = decomposition.seasonal
+                if seasonal is None or len(seasonal) == 0:
+                    print("Seasonal decomposition failed to produce seasonal component")
+                    self.seasonality_extracted = False
+                    return np.ones(self.seasonal_periods)
+                
+                # Calculate average seasonal factors for each period
+                seasonal_factors = np.zeros(self.seasonal_periods)
+                for i in range(self.seasonal_periods):
+                    factors = seasonal[i::self.seasonal_periods]
+                    if len(factors) > 0:
+                        seasonal_factors[i] = np.mean(factors)
+                
+                # Convert additive factors to multiplicative
+                base_level = np.mean(data_for_decomp)
+                multiplicative_factors = (base_level + seasonal_factors) / base_level
+                
+                # Ensure factors are positive and finite
+                multiplicative_factors = np.clip(multiplicative_factors, 0.1, 10.0)
+                
+                # Normalize factors
+                multiplicative_factors = multiplicative_factors / np.mean(multiplicative_factors)
+                
+                # Check if we found significant seasonality
+                variation = np.std(multiplicative_factors)
+                print(f"Seasonal variation: {variation:.3f}")
+                
+                if variation > 0.05:  # 5% threshold
+                    print("✅ Seasonality successfully extracted")
+                    self.seasonality_extracted = True
+                else:
+                    print("No significant seasonality found")
+                    self.seasonality_extracted = False
+                    return np.ones(self.seasonal_periods)
+                
+                return multiplicative_factors
+                
+            except Exception as e:
+                print(f"Error during decomposition: {str(e)}")
+                self.seasonality_extracted = False
+                return np.ones(self.seasonal_periods)
+            
+        except Exception as e:
+            print(f"Error in seasonality extraction: {str(e)}")
+            self.seasonality_extracted = False
+            return np.ones(self.seasonal_periods)
+
+    def forecast(self, data, periods):
+        try:
+            print("\nStarting Seasonal Normal Distribution forecast...")
+            
+            # Reset seasonality flag
+            self.seasonality_extracted = False
+            
+            # Extract seasonal factors
+            seasonal_factors = self.extract_seasonality(data)
+            print(f"Seasonal factors detected: {seasonal_factors}")
+            print(f"Seasonality extracted: {self.seasonality_extracted}")
+            
+            # Calculate mean and standard deviation of deseasonalized data
+            deseasonalized_data = data.values / np.tile(
+                seasonal_factors, 
+                len(data) // self.seasonal_periods + 1
+            )[:len(data)]
+            
+            mean = np.mean(deseasonalized_data)
+            std = np.std(deseasonalized_data)
+            
+            print(f"Base distribution - Mean: {mean:.2f}, Std: {std:.2f}")
+            
+            # Generate multiple forecasts and take the best one
+            num_attempts = 10
+            best_forecast = None
+            min_zeros = float('inf')
+            
+            for attempt in range(num_attempts):
+                # Generate base forecast
+                base_forecast = np.random.normal(mean, std, periods)
+                
+                # Apply seasonality
+                seasonal_indices = np.arange(periods) % self.seasonal_periods
+                forecast = base_forecast * seasonal_factors[seasonal_indices]
+                
+                # Make non-negative
+                forecast = np.maximum(forecast, 0)
+                
+                # Count zeros
+                zero_count = np.sum(forecast == 0)
+                
+                if zero_count < min_zeros:
+                    min_zeros = zero_count
+                    best_forecast = forecast
+            
+            # Convert to series for zero handling
+            last_date = data.index[-1]
+            date_range = pd.date_range(
+                start=last_date + pd.Timedelta(days=7),
+                periods=periods,
+                freq='W'
+            )
+            forecast_series = pd.Series(best_forecast, index=date_range)
+            
+            # Handle any remaining zeros
+            forecast_series = self.handle_zero_demand(forecast_series)
+            
+            # Calculate confidence intervals considering seasonality
+            confidence = 0.95
+            degrees_of_freedom = len(data) - 1
+            t_value = stats.t.ppf((1 + confidence) / 2, degrees_of_freedom)
+            
+            # Adjust margin of error for seasonality
+            seasonal_indices = np.arange(periods) % self.seasonal_periods
+            seasonal_std = std * seasonal_factors[seasonal_indices]
+            margin_of_error = t_value * (seasonal_std / np.sqrt(len(data)))
+            
+            lower = forecast_series - margin_of_error
+            upper = forecast_series + margin_of_error
+            
+            # Make non-negative and round
+            forecast_series = np.round(forecast_series)
+            lower = np.maximum(np.round(lower), 0)
+            upper = np.maximum(np.round(upper), 0)
+            
+            return {
+                'mean': forecast_series,
+                'lower': pd.Series(lower, index=date_range),
+                'upper': pd.Series(upper, index=date_range)
+            }
+            
+        except Exception as e:
+            print(f"\n❌ Seasonal Normal Distribution forecast failed: {str(e)}")
+            raise ValueError(f"Seasonal Normal Distribution forecast failed: {str(e)}")
+
+    @staticmethod
+    def get_description():
+        return '''
+        Seasonal Normal Distribution Forecast: A sophisticated forecasting model that combines 
+        statistical distribution with seasonal pattern recognition.
+        
+        Core Components:
+        1. Seasonal Pattern Detection
+           - Uses advanced decomposition techniques
+           - Identifies monthly patterns in weekly data
+           - Adapts to varying seasonal strengths
+        
+        2. Statistical Foundation
+           - Based on Normal (Gaussian) distribution
+           - Incorporates mean and variance from historical data
+           - Adjusts for seasonal variations
+        
+        3. Advanced Features
+           - Automatic seasonality detection and validation
+           - Multiple forecast generation with zero-handling
+           - Seasonally-adjusted confidence intervals
+           - Robust handling of intermittent demand
+        
+        Best Used For:
+        ✓ Products with regular seasonal patterns
+        ✓ Medium to long-term forecasting (4-52 weeks)
+        ✓ Items with moderate to high sales volume
+        ✓ Retail and consumer goods
+        
+        Advantages:
+        + Captures both level and seasonal components
+        + Provides reliable confidence intervals
+        + Handles zero values intelligently
+        + Adapts to changing seasonal patterns
+        
+        Limitations:
+        - Requires sufficient historical data (>8 weeks)
+        - May not capture sudden trend changes
+        - Assumes relatively stable seasonal patterns
+        
+        Technical Details:
+        • Seasonality Detection: Uses additive decomposition
+        • Distribution: Normal with seasonal adjustments
+        • Confidence Intervals: t-distribution based
+        • Zero Handling: Multiple strategies available
+        '''
+
+
 class ARIMAForecast(ForecastModel):
     def forecast(self, data, periods):
         df = pd.DataFrame({'ds': data.index, 'y': data.values})

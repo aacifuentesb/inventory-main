@@ -1,7 +1,7 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
-from forecast import NormalDistributionForecast
+from forecast import NormalDistributionForecast, SeasonalNormalDistributionForecast
 from inventory import ModifiedContinuousReview
 from sku import run_inventory_system
 import plotly.graph_objects as go
@@ -140,11 +140,16 @@ def load_data(file):
 def run_multiple_sku_analysis(historic_data, master_data, periods):
     results = []
     supply_plans = []
-    forecast_model = NormalDistributionForecast(
+    # Reset seasonality counter at the start of each analysis
+    st.session_state.seasonality_extracted = 0
+    
+    forecast_model = SeasonalNormalDistributionForecast(
         zero_demand_strategy='rolling_mean',
         rolling_window=4,
-        zero_train_strategy='mean'
+        zero_train_strategy='mean',
+        seasonal_periods=4
     )
+    
     inventory_model = ModifiedContinuousReview()
     
     progress_bar = st.progress(0)
@@ -209,6 +214,10 @@ def run_multiple_sku_analysis(historic_data, master_data, periods):
             )
             
             if sku is not None:
+                # Update seasonality counter if seasonality was extracted
+                if forecast_model.seasonality_extracted:
+                    st.session_state.seasonality_extracted += 1
+                
                 # Collect results
                 results.append({
                     'SKU': sku_params['SKU'],
@@ -223,7 +232,8 @@ def run_multiple_sku_analysis(historic_data, master_data, periods):
                                         np.mean(sku.inventory_evolution)) if np.mean(sku.inventory_evolution) > 0 else 0,
                     'EOQ': float(sku.inventory_policy.get('eoq', 0)),
                     'Reorder Point': float(sku.inventory_policy.get('reorder_point', 0)),
-                    'Safety Stock': float(sku.inventory_policy.get('safety_stock', 0))
+                    'Safety Stock': float(sku.inventory_policy.get('safety_stock', 0)),
+                    'Seasonality Extracted': forecast_model.seasonality_extracted
                 })
                 
                 # Collect supply plan
@@ -422,11 +432,17 @@ def display_overall_metrics(results_df):
     st.subheader("Summary Metrics")
     
     # Summary metrics in columns
-    col1, col2, col3, col4 = st.columns(4)
+    col1, col2, col3, col4, col5 = st.columns(5)
     col1.metric("Average Service Level", f"{results_df['Service Level'].mean():.2%}")
     col2.metric("Average Inventory Turnover", f"{results_df['Inventory Turnover'].mean():.2f}")
     col3.metric("Total Cost", f"${results_df['Total Cost'].sum():,.2f}")
     col4.metric("Total Sales", f"${results_df['Total Sales'].sum():,.2f}")
+    
+    # Add seasonality success metric if available
+    if 'seasonality_extracted' in st.session_state:
+        success_rate = st.session_state.seasonality_extracted / len(results_df) * 100
+        col5.metric("Seasonality Extraction", f"{success_rate:.1f}%", 
+                   f"{st.session_state.seasonality_extracted}/{len(results_df)} SKUs")
     
     # Global analysis dashboard
     st.plotly_chart(plot_global_analysis(results_df), use_container_width=True)
@@ -1060,6 +1076,8 @@ def main():
         st.session_state.supply_plan_df = None
     if 'warnings_container' not in st.session_state:
         st.session_state.warnings_container = None
+    if 'seasonality_extracted' not in st.session_state:
+        st.session_state.seasonality_extracted = 0
     
     uploaded_file = st.file_uploader("Upload Excel file", type=['xlsx'])
     
