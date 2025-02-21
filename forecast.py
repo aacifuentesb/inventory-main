@@ -524,6 +524,36 @@ class SeasonalNormalDistributionForecast(ForecastModel):
         Seasonal Normal Distribution Forecast: A sophisticated forecasting model that combines 
         statistical distribution with seasonal pattern recognition.
         
+        Mathematical Foundation:
+        1. Seasonal Decomposition
+           Yt = Tt + St + Rt  (Additive)
+           where:
+           • Yt: Original time series
+           • Tt: Trend component
+           • St: Seasonal component
+           • Rt: Residual component
+        
+        2. Seasonal Factors
+           SF[i] = (Base + S[i]) / Base
+           where:
+           • SF[i]: Seasonal factor for period i
+           • Base: Mean of the series
+           • S[i]: Additive seasonal component
+        
+        3. Forecast Generation
+           F[t] = N(μ, σ) × SF[t mod s]
+           where:
+           • N(μ, σ): Normal distribution with mean μ and std σ
+           • SF[t mod s]: Seasonal factor for period t
+           • s: Seasonal period length (4 weeks)
+        
+        4. Confidence Intervals
+           CI[t] = F[t] ± t(α/2, n-1) × σ × SF[t mod s] / √n
+           where:
+           • t(α/2, n-1): t-distribution value
+           • n: Sample size
+           • α: Significance level (0.05 for 95% CI)
+        
         Core Components:
         1. Seasonal Pattern Detection
            - Uses advanced decomposition techniques

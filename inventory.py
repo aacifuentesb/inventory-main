@@ -485,75 +485,123 @@ class ModifiedContinuousReview(InventoryModel):
         if len(non_zero_sales) < 2:
             raise ValueError(f"Insufficient historical sales data. Found only {len(non_zero_sales)} non-zero sales points, minimum required is 2.")
             
-        # Calculate demand statistics
-        annual_demand = np.sum(demand) * (52 / len(demand))
+        # Clean up extreme peaks
+        demand_cleaned = demand.copy()
+        if len(demand) >= 2:
+            sorted_demand = np.sort(demand)
+            highest = sorted_demand[-1]
+            second_highest = sorted_demand[-2]
+            
+            if highest > second_highest * 5:
+                print(f"Found extreme peak: {highest} (5x > second highest: {second_highest})")
+                # Replace extreme peak with average for forecasting
+                peak_indices = np.where(demand == highest)[0]
+                demand_cleaned[peak_indices] = np.mean(demand[demand != highest])
+                print(f"Replaced extreme peak(s) with average: {demand_cleaned[peak_indices][0]}")
+            
+        # Calculate demand statistics with more emphasis on peaks
+        annual_demand = np.sum(demand_cleaned) * (52 / len(demand_cleaned))
         annual_demand = max(annual_demand, 0.01)
         
-        avg_weekly_demand = np.mean(demand)
-        std_weekly_demand = max(np.std(demand), 0.1 * avg_weekly_demand)  # Ensure some variability
+        avg_weekly_demand = np.mean(demand_cleaned)
+        peak_weekly_demand = np.percentile(demand_cleaned, 97.5)  # Using 97.5th percentile
+        std_weekly_demand = max(np.std(demand_cleaned), 0.3 * avg_weekly_demand)  # Increased minimum variability
         
+        # Calculate coefficient of variation to detect erratic demand
+        cv = std_weekly_demand / avg_weekly_demand if avg_weekly_demand > 0 else float('inf')
+        is_erratic = cv > 0.5  # Threshold for erratic demand
+        
+        # For erratic demand, analyze recent trend
+        if is_erratic:
+            # Use the last 8 weeks to detect trend
+            if len(demand_cleaned) >= 8:
+                recent_demand = demand_cleaned[-8:]
+                recent_avg = np.mean(recent_demand)
+                recent_peak = np.max(recent_demand)  # Use absolute max for recent demand
+                
+                # If recent demand is higher, adjust estimates upward
+                avg_weekly_demand = max(avg_weekly_demand, recent_avg)
+                peak_weekly_demand = max(peak_weekly_demand, recent_peak)
+                annual_demand = max(annual_demand, recent_avg * 52)
+        
+        # Calculate protected period with buffer
         lead_time = params['lead_time_weeks']
         review_period = params['review_period']
-        
-        # Calculate demand during lead time plus review period
         protected_period = lead_time + review_period
-        protected_period_demand = avg_weekly_demand * protected_period
+        
+        # Use peak demand for protected period calculation
+        protected_period_demand = peak_weekly_demand * protected_period * (1.5 if is_erratic else 1.2)
         protected_period_std = std_weekly_demand * np.sqrt(protected_period)
         
-        # Calculate minimum EOQ based on average weekly demand and review period
-        min_eoq = max(
-            avg_weekly_demand * review_period,  # At least cover review period demand
-            np.ceil(np.percentile(non_zero_sales, 25))  # Use 25th percentile of non-zero sales only
-        )
-        
-        # Calculate EOQ
-        if 'eoq' in params:
-            order_quantity = max(params['eoq'], min_eoq)
-        else:
-            if params['order_cost'] > 0:
-                basic_eoq = np.sqrt((2 * params['order_cost'] * annual_demand) / params['holding_cost'])
-                order_quantity = max(
-                    min_eoq,
-                    avg_weekly_demand * review_period * np.ceil(basic_eoq / (avg_weekly_demand * review_period))
-                )
-            else:
-                z = stats.norm.ppf(params['service_level'])
-                order_quantity = max(
-                    min_eoq,
-                    avg_weekly_demand * review_period,
-                    z * protected_period_std
-                )
-        
-        # Calculate safety stock based on service level and demand variability
+        # Calculate safety stock with higher buffer for erratic demand
         z = stats.norm.ppf(params['service_level'])
+        safety_factor = 2.0 if is_erratic else 1.5  # Increased safety factors
+        safety_stock = safety_factor * z * protected_period_std
         
-        # Enhanced safety stock calculation considering:
-        # 1. Service level (through z-score)
-        # 2. Demand variability (std_weekly_demand)
-        # 3. Protected period (lead time + review period)
-        # 4. Minimum safety factor based on service level
-        min_safety_factor = max(0.5, (params['service_level'] - 0.5) * 2)  # Maps service level 0.5-1.0 to 0.5-1.0
+        # Add additional buffer based on peak demand
+        if is_erratic:
+            safety_stock += peak_weekly_demand * review_period
         
-        base_safety_stock = z * protected_period_std
-        min_safety_stock = min_safety_factor * avg_weekly_demand * np.sqrt(protected_period)
+        # Ensure minimum safety stock
+        min_safety_stock = peak_weekly_demand * review_period
+        safety_stock = max(safety_stock, min_safety_stock)
         
-        safety_stock = max(
-            base_safety_stock,
-            min_safety_stock,
-            0.5 * avg_weekly_demand * review_period  # Minimum half of review period demand
+        # Calculate reorder point
+        reorder_point = protected_period_demand + safety_stock
+        
+        # Calculate target level with higher buffer
+        peak_factor = 1.5 if is_erratic else 1.2
+        target_level = reorder_point + peak_weekly_demand * review_period * peak_factor
+        
+        # Calculate base EOQ with increased penalties for stockouts
+        holding_cost_annual = params['holding_cost'] * 52
+        stockout_penalty = params['stockout_cost'] * (3 if is_erratic else 1.5)  # Increased penalty
+        
+        # Enhanced EOQ calculation
+        if is_erratic:
+            # Calculate EOQ based on peak demand
+            peak_annual_demand = peak_weekly_demand * 52
+            base_eoq = np.sqrt(
+                (2 * peak_annual_demand * 
+                 (params['order_cost'] + stockout_penalty)) /
+                holding_cost_annual
+            )
+            
+            # Ensure EOQ is large enough
+            base_eoq = max(
+                base_eoq,
+                peak_weekly_demand * (lead_time + 2),  # Increased coverage
+                protected_period_demand * 0.75  # Increased minimum
+            )
+        else:
+            base_eoq = np.sqrt(
+                (2 * annual_demand * 
+                 (params['order_cost'] + stockout_penalty)) /
+                holding_cost_annual
+            )
+        
+        # Calculate dynamic order quantity
+        current_position = params['initial_inventory']
+        deficit_to_target = max(target_level - current_position, 0)
+        
+        # Order quantity will be the maximum of:
+        order_quantity = max(
+            deficit_to_target,
+            base_eoq,
+            protected_period_demand,
+            peak_weekly_demand * (lead_time + review_period)  # Added minimum based on peak
         )
         
-        # Calculate reorder point - ALWAYS includes safety stock
-        reorder_point = protected_period_demand + safety_stock
-            
-        # Final validation to ensure logical relationships
-        safety_stock = max(safety_stock, 0.1 * reorder_point)  # Safety stock at least 10% of reorder point
-        reorder_point = protected_period_demand + safety_stock  # Recalculate to maintain relationship
+        # Round up to the nearest multiple of peak demand
+        if peak_weekly_demand > 0:
+            multiple = 2.0 if is_erratic else 1.5  # Increased multiples
+            order_quantity = np.ceil(order_quantity / (peak_weekly_demand * multiple)) * (peak_weekly_demand * multiple)
         
         self.policy = {
-            'eoq': np.round(max(order_quantity, 1)),  # Ensure minimum of 1
+            'eoq': np.round(max(order_quantity, 1)),
             'reorder_point': np.round(reorder_point),
-            'safety_stock': np.round(safety_stock)
+            'safety_stock': np.round(safety_stock),
+            'target_level': np.round(target_level)
         }
         
         return self.policy
@@ -591,15 +639,20 @@ class ModifiedContinuousReview(InventoryModel):
             # Calculate reorder point based on safety stock
             reorder_point = protected_period_demand + safety_stock
             
+            # Calculate target level (S)
+            target_level = reorder_point + avg_weekly_demand * review_period
+            
             current_params = params.copy()
             current_params['eoq'] = np.round(eoq)
             current_params['safety_stock'] = np.round(safety_stock)
             current_params['reorder_point'] = np.round(reorder_point)
+            current_params['target_level'] = np.round(target_level)
 
             self.policy = {
                 'eoq': np.round(eoq),
                 'safety_stock': np.round(safety_stock),
-                'reorder_point': np.round(reorder_point)
+                'reorder_point': np.round(reorder_point),
+                'target_level': np.round(target_level)
             }
 
             # Simulate inventory
@@ -629,11 +682,13 @@ class ModifiedContinuousReview(InventoryModel):
             safety_stock = max(base_safety_stock, min_safety_stock)
             reorder_point = protected_period_demand + safety_stock
             eoq = max(avg_weekly_demand * review_period, 1)
+            target_level = reorder_point + avg_weekly_demand * review_period
             
             best_policy = {
                 'eoq': np.round(eoq),
                 'safety_stock': np.round(safety_stock),
-                'reorder_point': np.round(reorder_point)
+                'reorder_point': np.round(reorder_point),
+                'target_level': np.round(target_level)
             }
 
         self.policy = best_policy
@@ -651,11 +706,14 @@ class ModifiedContinuousReview(InventoryModel):
         inventory[0] = params['initial_inventory']
         lead_time = params['lead_time_weeks']
         review_period = params['review_period']
+        target_level = self.policy['target_level']
 
-        # Check if we should order in the first period
+        # Initial order if needed
         inventory_position = inventory[0] + sum(orders[max(0, 0-lead_time):0])
         if inventory_position <= self.policy['reorder_point']:
-            order_quantity = self.policy['eoq']
+            # Calculate dynamic order quantity
+            deficit_to_target = max(target_level - inventory_position, 0)
+            order_quantity = max(deficit_to_target, self.policy['eoq'])
             orders[0] = order_quantity
             if lead_time < periods:
                 orders_arriving[lead_time] += order_quantity
@@ -683,13 +741,15 @@ class ModifiedContinuousReview(InventoryModel):
                           inventory[t] * params['holding_cost'] -
                           unfufilled_demand[t] * params['stockout_cost'])
             
-            # Check for ordering (only on review periods after first order)
+            # Check for ordering (only on review periods)
             if t % review_period == 0:
                 inventory_position = (inventory[t] + 
-                                      np.sum(orders[max(0, t-lead_time+1):t]))
+                                   np.sum(orders[max(0, t-lead_time+1):t]))
                 
                 if inventory_position <= self.policy['reorder_point']:
-                    order_quantity = self.policy['eoq']
+                    # Calculate dynamic order quantity
+                    deficit_to_target = max(target_level - inventory_position, 0)
+                    order_quantity = max(deficit_to_target, self.policy['eoq'])
                     orders[t] = order_quantity
                     if t + lead_time < periods:
                         orders_arriving[t + lead_time] += order_quantity
@@ -702,7 +762,7 @@ class ModifiedContinuousReview(InventoryModel):
     @staticmethod
     def get_description():
         return """
-        Enhanced (r, Q) Periodic Review Policy with Dynamic Safety Stock
+        Enhanced (r, Q) Periodic Review Policy with Dynamic Safety Stock and Peak Handling
 
         This policy uses three main parameters:
         - r (reorder point): When the inventory position (on-hand + on-order) reaches this point, an order is placed
@@ -710,26 +770,38 @@ class ModifiedContinuousReview(InventoryModel):
         - SS (safety stock): Dynamic buffer stock that protects against demand variability and lead time uncertainty
 
         Key enhancements:
-        1. Dynamic Safety Stock: Calculated based on:
+        1. Intelligent Peak Handling:
+           - Detects and adjusts extreme demand peaks (5x > second highest)
+           - Replaces extreme peaks with average demand for forecasting
+           - Prevents overestimation of inventory parameters due to outliers
+           - Maintains realistic demand patterns while handling anomalies
+
+        2. Dynamic Safety Stock: Calculated based on:
            - Service level requirements (higher service level = higher safety stock)
            - Demand variability (more variable demand = higher safety stock)
            - Protected period (lead time + review period)
            - Minimum safety factor based on service level
+           - Erratic demand detection and compensation
         
-        2. Protected Period Approach:
+        3. Protected Period Approach:
            - Considers both lead time and review period in calculations
            - Accounts for demand variability during the entire protected period
+           - Uses peak demand analysis for protected period calculations
            - Ensures safety stock never falls below critical thresholds
 
-        3. Robust Optimization:
+        4. Robust Optimization:
            - Prevents zero or insufficient safety stock
            - Maintains logical relationship between safety stock and reorder point
            - Adapts to different demand patterns and service level requirements
+           - Handles erratic demand with increased safety factors
 
         Key formulas:
+        - Peak Detection: peak > 2nd_highest * 5
+        - Cleaned Demand: Replaces peaks with avg(non_peak_demand)
         - Safety Stock: SS = max(z * σ * √(L + R), min_safety_factor * μ * √(L + R), 0.5 * μ * R)
         - Reorder Point: r = μ(L + R) + SS
         - Modified EOQ: Q = ceil(√((2AD) / h) / (R * μ)) * R * μ
+        - Erratic Detection: CV = σ/μ > 0.5
 
         Where:
         - z: safety factor based on service level
@@ -740,6 +812,19 @@ class ModifiedContinuousReview(InventoryModel):
         - A: fixed cost per order
         - D: annual demand
         - h: holding cost per unit per year
+        - CV: coefficient of variation
 
-        This enhanced version provides a more robust inventory management strategy by ensuring adequate safety stock levels while balancing holding costs and service level requirements.
+        This enhanced version provides:
+        1. More stable forecasting by handling extreme peaks
+        2. Better adaptation to erratic demand patterns
+        3. More realistic safety stock calculations
+        4. Prevention of overestimation due to outliers
+        5. Balanced approach between service level and cost
+        6. Protection against both regular and extreme demand variations
+
+        Best suited for:
+        - Products with occasional extreme demand spikes
+        - Items with erratic demand patterns
+        - Critical inventory items requiring high service levels
+        - Products with long lead times or review periods
         """
