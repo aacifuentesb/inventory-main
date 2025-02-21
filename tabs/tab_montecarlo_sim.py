@@ -139,8 +139,19 @@ def display_montecarlo_sim(selected_sku,selected_forecast_model, params, forecas
         num_simulations = st.number_input("Number of Simulations", min_value=1, max_value=10000, value=10)
         
         if st.button("Run Sensitivity Analysis"):
+            # Get session state values before creating thread
+            current_sku = st.session_state.sku
+            current_forecast_model = forecast_models[selected_forecast_model]
+            current_inventory_model = inventory_models[selected_inventory_model]
+            
             with st.spinner("Running sensitivity analysis..."):
-                summary_results, detailed_results = run_sensitivity_analysis(df, selected_sku, params, forecast_models[selected_forecast_model], inventory_models[selected_inventory_model], periods, start_time, num_simulations, initial_inventory)
+                summary_results, detailed_results = run_sensitivity_analysis(
+                    df, selected_sku, params, 
+                    current_forecast_model,
+                    current_inventory_model,
+                    periods, start_time, 
+                    num_simulations, initial_inventory
+                )
                 st.session_state.summary_results = summary_results
                 st.session_state.detailed_results = detailed_results
 
