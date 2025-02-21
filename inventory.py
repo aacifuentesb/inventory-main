@@ -529,8 +529,10 @@ class ModifiedContinuousReview(InventoryModel):
         protected_period_demand = avg_weekly_demand * protected_period
         protected_period_std = std_weekly_demand * np.sqrt(protected_period)
 
+        mean_demand = np.mean(demand)
         param_ranges = {
-            'eoq': (np.mean(demand) * params['review_period'] * 0.5, np.mean(demand) * params['review_period'] * 10),
+            'eoq': (max(mean_demand * params['review_period'] * 0.5, 1), 
+                    mean_demand * params['review_period'] * 10),
             'safety_stock': (0, protected_period_std * 3),  # Up to 3 sigma for safety stock
             'reorder_point': (protected_period_demand, protected_period_demand * 3)
         }

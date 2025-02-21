@@ -121,23 +121,78 @@ def aggregate_weekly(df):
     return df.groupby(['SKU', 'Week'])['QTY'].sum().reset_index()
 
 def generate_weekly_time_series(df, sku_id):
+    """
+    Generate weekly time series for a SKU, filling zeros from last sale to current date
+    
+    Parameters:
+    -----------
+    df : pd.DataFrame
+        DataFrame containing 'Date', 'SKU', and 'QTY' columns
+    sku_id : str
+        SKU identifier to filter data
+        
+    Returns:
+    --------
+    pd.Series
+        Weekly aggregated time series with zeros filled up to current date
+    """
+    # Filter data for specific SKU
     sku_data = df[df['SKU'] == sku_id].copy()
     sku_data['Date'] = pd.to_datetime(sku_data['Date'])
+    
+    # Get the start date (first sale) and end date (current date)
+    start_date = sku_data['Date'].min()
+    current_date = pd.Timestamp.now()
+    # Round to previous Monday to ensure consistent weekly boundaries
+    current_date = current_date - pd.Timedelta(days=current_date.weekday())
+    
+    # Create complete date range from start to current date
+    full_range = pd.date_range(start=start_date, end=current_date, freq='W-MON')
+    
+    # Aggregate by week and reindex to fill missing weeks with zeros
     sku_data.set_index('Date', inplace=True)
-    weekly_data = sku_data['QTY'].resample('W-MON').sum().reset_index()
-    weekly_data.set_index('Date', inplace=True)
-    full_range = pd.date_range(start=weekly_data.index.min(), end=weekly_data.index.max(), freq='W-MON')
+    weekly_data = sku_data['QTY'].resample('W-MON').sum()
     weekly_data = weekly_data.reindex(full_range, fill_value=0)
-    return weekly_data['QTY']
+    
+    return weekly_data
 
-def run_inventory_system(df, sku_id, params, forecast_model, inventory_model, periods, start_time):
-    # Filter data based on start time
-    start_time = pd.to_datetime(start_time)
-    df = df[df['Date'] >= start_time]
+def run_inventory_system(df, sku_id, params, forecast_model, inventory_model, periods, start_time=None):
+    """
+    Run inventory system simulation for a SKU
+    
+    Parameters:
+    -----------
+    df : pd.DataFrame
+        DataFrame containing historical data
+    sku_id : str
+        SKU identifier
+    params : dict
+        Parameters for the inventory system
+    forecast_model : ForecastModel
+        Forecasting model to use
+    inventory_model : InventoryModel
+        Inventory model to use
+    periods : int
+        Number of periods to forecast
+    start_time : datetime, optional
+        Start time for analysis. If None, uses all available data
+        
+    Returns:
+    --------
+    SKU
+        SKU object with simulation results
+    """
+    if start_time is not None:
+        start_time = pd.to_datetime(start_time)
+        df = df[df['Date'] >= start_time].copy()
+    
     weekly_data = generate_weekly_time_series(df, sku_id)
-    sku = SKU(sku_id, weekly_data, params, forecast_model, inventory_model,periods)
+    
+    # Create SKU object and run simulation
+    sku = SKU(sku_id, weekly_data, params, forecast_model, inventory_model, periods)
     sku.generate_forecast(periods)
     sku.calculate_inventory_policy()
     sku.simulate_inventory(sku.forecast['mean'], periods)
+    
     return sku
 

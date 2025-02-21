@@ -210,7 +210,10 @@ def run_multiple_sku_analysis(historic_data, master_data, periods):
                                         params['price'])),
                     'Stockout Rate': float(np.mean(sku.stockouts)),
                     'Inventory Turnover': float(np.sum(sku.demand_evolution) / 
-                                        np.mean(sku.inventory_evolution)) if np.mean(sku.inventory_evolution) > 0 else 0
+                                        np.mean(sku.inventory_evolution)) if np.mean(sku.inventory_evolution) > 0 else 0,
+                    'EOQ': float(sku.inventory_policy.get('eoq', 0)),
+                    'Reorder Point': float(sku.inventory_policy.get('reorder_point', 0)),
+                    'Safety Stock': float(sku.inventory_policy.get('safety_stock', 0))
                 })
                 
                 # Collect supply plan
@@ -366,7 +369,10 @@ def display_overall_metrics(results_df):
             'Total Cost': '${:,.2f}',
             'Total Sales': '${:,.2f}',
             'Stockout Rate': '{:.2%}',
-            'Inventory Turnover': '{:.2f}'
+            'Inventory Turnover': '{:.2f}',
+            'EOQ': '{:.1f}',
+            'Reorder Point': '{:.1f}',
+            'Safety Stock': '{:.1f}'
         }),
         use_container_width=True
     )
@@ -383,9 +389,11 @@ def display_supply_demand_plan(supply_plan_df, results_df):
     # Filter data based on selection
     if selected_sku != 'All SKUs':
         filtered_plan = supply_plan_df[supply_plan_df['SKU'] == selected_sku]
+        filtered_results = results_df[results_df['SKU'] == selected_sku]
         title_suffix = f" - {selected_sku}"
     else:
         filtered_plan = supply_plan_df
+        filtered_results = results_df
         title_suffix = " - All SKUs"
     
     # Aggregate data by date
@@ -397,53 +405,100 @@ def display_supply_demand_plan(supply_plan_df, results_df):
         'Stockouts': 'sum'
     }).reset_index()
     
-    # Create plots
-    fig1 = go.Figure()
-    fig1.add_trace(go.Scatter(
-        x=daily_plan['Date'], 
+    # Sort by date to ensure temporal correctness
+    daily_plan = daily_plan.sort_values('Date')
+    
+    # Create combined plot
+    fig = go.Figure()
+    
+    # Add Forecast Demand
+    fig.add_trace(go.Scatter(
+        x=daily_plan['Date'],
         y=daily_plan['Forecast Demand'],
+        mode='lines',
         name='Forecast Demand',
+        line=dict(dash='dash')
+    ))
+    
+    # Add Inventory Level
+    fig.add_trace(go.Scatter(
+        x=daily_plan['Date'],
+        y=daily_plan['Inventory Level'],
+        mode='lines',
+        name='Inventory Level',
         line=dict(color='blue')
     ))
-    fig1.add_trace(go.Scatter(
-        x=daily_plan['Date'], 
-        y=daily_plan['Order Quantity'],
-        name='Order Quantity',
-        line=dict(color='green')
-    ))
-    fig1.update_layout(
-        title=f"Demand vs Orders{title_suffix}",
-        xaxis_title="Date",
-        yaxis_title="Units",
-        height=400
-    )
-    st.plotly_chart(fig1, use_container_width=True)
     
-    fig2 = go.Figure()
-    fig2.add_trace(go.Scatter(
-        x=daily_plan['Date'], 
-        y=daily_plan['Inventory Level'],
-        name='Inventory Level',
-        line=dict(color='orange')
-    ))
-    fig2.add_trace(go.Scatter(
-        x=daily_plan['Date'], 
-        y=daily_plan['Orders Arriving'],
-        name='Orders Arriving',
-        line=dict(color='purple')
-    ))
-    fig2.update_layout(
-        title=f"Inventory Level and Incoming Orders{title_suffix}",
+    # Add Order Points as triangles
+    order_indices = daily_plan['Order Quantity'] > 0
+    if order_indices.any():
+        fig.add_trace(go.Scatter(
+            x=daily_plan.loc[order_indices, 'Date'],
+            y=daily_plan.loc[order_indices, 'Inventory Level'],
+            mode='markers',
+            name='Order Points',
+            marker=dict(
+                color='green',
+                symbol='triangle-up',
+                size=12
+            ),
+            hovertemplate="Order Quantity: %{text}<br>Date: %{x}<br>Inventory Level: %{y}<extra></extra>",
+            text=daily_plan.loc[order_indices, 'Order Quantity']
+        ))
+    
+    # Add Orders Arriving as diamonds
+    arriving_indices = daily_plan['Orders Arriving'] > 0
+    if arriving_indices.any():
+        fig.add_trace(go.Scatter(
+            x=daily_plan.loc[arriving_indices, 'Date'],
+            y=daily_plan.loc[arriving_indices, 'Orders Arriving'],
+            mode='markers',
+            name='Orders Arriving',
+            marker=dict(
+                color='purple',
+                symbol='diamond',
+                size=8
+            ),
+            hovertemplate="Arriving Quantity: %{y}<br>Date: %{x}<extra></extra>"
+        ))
+    
+    # Add Reorder Point if viewing a single SKU
+    if selected_sku != 'All SKUs':
+        sku_policy = dict(zip(results_df['SKU'], 
+                            zip(results_df['EOQ'], 
+                                results_df['Reorder Point'],
+                                results_df['Safety Stock']))).get(selected_sku)
+        if sku_policy:
+            _, reorder_point, _ = sku_policy
+            fig.add_trace(go.Scatter(
+                x=daily_plan['Date'],
+                y=[reorder_point] * len(daily_plan),
+                mode='lines',
+                name='Reorder Point',
+                line=dict(dash='dot', color='red')
+            ))
+    
+    fig.update_layout(
+        title=f"Supply and Demand Plan{title_suffix}",
         xaxis_title="Date",
-        yaxis_title="Units",
-        height=400
+        yaxis_title="Quantity",
+        hovermode='x unified',
+        showlegend=True,
+        legend=dict(
+            yanchor="top",
+            y=0.99,
+            xanchor="left",
+            x=0.01
+        ),
+        height=600  # Make the plot taller
     )
-    st.plotly_chart(fig2, use_container_width=True)
+    
+    st.plotly_chart(fig, use_container_width=True)
     
     # Supply Plan Table
     st.subheader("Supply Plan Details")
     st.dataframe(
-        filtered_plan.style.format({
+        filtered_plan.sort_values('Date').style.format({
             'Forecast Demand': '{:.0f}',
             'Order Quantity': '{:.0f}',
             'Orders Arriving': '{:.0f}',
@@ -564,10 +619,18 @@ def display_weekly_analysis(supply_plan_df, results_df):
     # Filter data based on selection
     if selected_sku != 'All SKUs':
         filtered_plan = supply_plan_df[supply_plan_df['SKU'] == selected_sku]
+        filtered_results = results_df[results_df['SKU'] == selected_sku]
         title_suffix = f" - {selected_sku}"
     else:
         filtered_plan = supply_plan_df
+        filtered_results = results_df
         title_suffix = " - All SKUs"
+    
+    # Create a dictionary of inventory policies for quick lookup
+    inventory_policies = dict(zip(results_df['SKU'], 
+                                zip(results_df['EOQ'], 
+                                    results_df['Reorder Point'],
+                                    results_df['Safety Stock'])))
     
     # Group by week
     filtered_plan['Week'] = filtered_plan['Date'].dt.strftime('%Y-W%W')
@@ -579,17 +642,38 @@ def display_weekly_analysis(supply_plan_df, results_df):
         'Stockouts': 'sum'
     }).reset_index()
     
-    # Calculate additional metrics
-    weekly_plan['Stock Coverage (weeks)'] = weekly_plan['Inventory Level'] / weekly_plan['Forecast Demand']
-    weekly_plan['Order Decision'] = np.where(
-        weekly_plan['Stock Coverage (weeks)'] < 2,
-        '🔴 Place Order',
-        np.where(
-            weekly_plan['Stock Coverage (weeks)'] < 4,
-            '🟡 Monitor',
-            '🟢 Sufficient'
-        )
+    # Calculate additional metrics with proper handling of edge cases
+    weekly_plan['Stock Coverage (weeks)'] = np.where(
+        weekly_plan['Forecast Demand'] > 0,
+        weekly_plan['Inventory Level'] / weekly_plan['Forecast Demand'],
+        np.where(weekly_plan['Inventory Level'] > 0, 999, 0)  # Use 999 for high inventory with no demand, 0 for no inventory
     )
+    
+    # Calculate recommended order quantity based on the inventory policy
+    def get_order_decision(row):
+        coverage = row['Stock Coverage (weeks)']
+        sku_policy = inventory_policies.get(row['SKU'])
+        
+        if sku_policy is None:
+            return '⚠️ No policy found'
+            
+        eoq, reorder_point, safety_stock = sku_policy
+        
+        if pd.isna(coverage) or coverage == 0:
+            if row['Inventory Level'] == 0:
+                return f'🔴 Place Order (EOQ: {eoq:.0f} units)'
+            return '⚠️ Check Forecast'
+            
+        inventory_position = row['Inventory Level'] + row['Orders Arriving']
+        
+        if inventory_position <= reorder_point:
+            return f'🔴 Place Order (EOQ: {eoq:.0f} units)'
+        elif coverage < 2:
+            return f'🟡 Monitor (Below target, ROP: {reorder_point:.0f})'
+        else:
+            return '🟢 Sufficient'
+
+    weekly_plan['Order Decision'] = weekly_plan.apply(get_order_decision, axis=1)
     
     # Create weekly status dashboard
     st.markdown("### Weekly Status Dashboard")
@@ -630,73 +714,54 @@ def display_weekly_analysis(supply_plan_df, results_df):
         st.markdown("### Weekly Decisions")
         decision_table = week_data[['SKU', 'Forecast Demand', 'Inventory Level', 
                                   'Stock Coverage (weeks)', 'Order Decision']].copy()
-        decision_table['Stock Coverage (weeks)'] = decision_table['Stock Coverage (weeks)'].round(1)
+        
+        # Format the Stock Coverage column
+        decision_table['Stock Coverage (weeks)'] = decision_table['Stock Coverage (weeks)'].apply(
+            lambda x: f"{x:.1f}" if x < 999 and x > 0 else "N/A" if x == 0 else ">999"
+        )
         
         # Create a style function that only applies to the Order Decision column
         def style_order_decision(row):
             color_map = {
-                '🔴 Place Order': 'background-color: #ffcccc',
-                '🟡 Monitor': 'background-color: #ffffcc',
-                '🟢 Sufficient': 'background-color: #ccffcc'
+                '🔴': 'background-color: #ffcccc',
+                '🟡': 'background-color: #ffffcc',
+                '🟢': 'background-color: #ccffcc',
+                '⚠️': 'background-color: #ffe5cc'
             }
-            return [color_map.get(row['Order Decision'], '')] * len(row)
+            decision_icon = row['Order Decision'][0]  # Get the first character (emoji)
+            return [color_map.get(decision_icon, '')] * len(row)
         
         # Apply styling with number formatting
         styled_table = decision_table.style\
             .format({
                 'Forecast Demand': '{:,.0f}',
-                'Inventory Level': '{:,.0f}',
-                'Stock Coverage (weeks)': '{:.1f}'
+                'Inventory Level': '{:,.0f}'
             })\
             .apply(style_order_decision, axis=1)
         
         st.dataframe(styled_table, use_container_width=True)
         
-        # Trend analysis
-        st.markdown("### Trend Analysis")
-        trend_data = filtered_plan.groupby('Week').agg({
-            'Forecast Demand': 'sum',
-            'Inventory Level': 'mean',
-            'Orders Arriving': 'sum'
-        }).reset_index()
-        
-        fig = go.Figure()
-        fig.add_trace(go.Scatter(
-            x=trend_data['Week'],
-            y=trend_data['Forecast Demand'],
-            name='Forecast Demand',
-            line=dict(color='blue')
-        ))
-        fig.add_trace(go.Scatter(
-            x=trend_data['Week'],
-            y=trend_data['Inventory Level'],
-            name='Inventory Level',
-            line=dict(color='orange')
-        ))
-        fig.add_trace(go.Scatter(
-            x=trend_data['Week'],
-            y=trend_data['Orders Arriving'],
-            name='Orders Arriving',
-            line=dict(color='green')
-        ))
-        
-        fig.update_layout(
-            title=f"Weekly Trends{title_suffix}",
-            xaxis_title="Week",
-            yaxis_title="Units",
-            height=400
-        )
-        st.plotly_chart(fig, use_container_width=True)
-        
         # Recommendations
         st.markdown("### Recommendations")
         for _, row in decision_table.iterrows():
-            if row['Order Decision'] == '🔴 Place Order':
-                st.warning(f"SKU {row['SKU']}: Stock coverage is low ({row['Stock Coverage (weeks)']:.1f} weeks). " +
-                          f"Consider ordering {max(row['Forecast Demand'] * 4 - row['Inventory Level'], 0):.0f} units.")
-            elif row['Order Decision'] == '🟡 Monitor':
-                st.info(f"SKU {row['SKU']}: Stock coverage is moderate ({row['Stock Coverage (weeks)']:.1f} weeks). " +
-                       "Monitor demand patterns.")
+            sku_policy = inventory_policies.get(row['SKU'])
+            if sku_policy:
+                eoq, reorder_point, safety_stock = sku_policy
+                if '🔴' in row['Order Decision']:
+                    st.warning(
+                        f"SKU {row['SKU']}: {row['Order Decision']}\n" +
+                        f"- Current Inventory: {row['Inventory Level']:,.0f}\n" +
+                        f"- Reorder Point: {reorder_point:,.0f}\n" +
+                        f"- Safety Stock: {safety_stock:,.0f}"
+                    )
+                elif '🟡' in row['Order Decision']:
+                    st.info(
+                        f"SKU {row['SKU']}: Stock coverage is moderate ({row['Stock Coverage (weeks)']} weeks).\n" +
+                        f"- Current Inventory: {row['Inventory Level']:,.0f}\n" +
+                        f"- Reorder Point: {reorder_point:,.0f}"
+                    )
+                elif '⚠️' in row['Order Decision']:
+                    st.warning(f"SKU {row['SKU']}: Unable to calculate stock coverage. Please check forecast and inventory data.")
 
 def main():
     display_logo_and_title()

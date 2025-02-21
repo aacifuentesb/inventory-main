@@ -1,8 +1,51 @@
-# Inventory Management System
+# 📦 Advanced Inventory Management System
 
-## Overview
+![GitHub](https://img.shields.io/github/license/yourusername/inventory-management-system)
+![Python](https://img.shields.io/badge/python-3.8%2B-blue)
+![Streamlit](https://img.shields.io/badge/streamlit-1.24%2B-red)
 
-This Inventory Management System is a Streamlit-based web application designed to help businesses optimize their inventory control processes. It provides powerful tools for demand forecasting, inventory policy calculation, and performance analysis.
+## 🎯 Overview
+
+A comprehensive Inventory Management System built with Streamlit, designed for enterprise-level supply chain optimization. The system provides advanced demand forecasting, inventory optimization, and supply chain analytics through an intuitive web interface.
+
+### System Architecture
+
+```mermaid
+graph TD
+    A[Excel Data Input] --> B[Data Processing]
+    B --> C[Forecast Engine]
+    B --> D[Inventory Engine]
+    C --> E[Analysis Engine]
+    D --> E
+    E --> F[Visualization Layer]
+    F --> G[Reports & Downloads]
+    
+    subgraph "Data Flow"
+        direction LR
+        B --> |Clean Data| C
+        C --> |Forecasts| E
+        D --> |Inventory Policies| E
+        E --> |Results| F
+    end
+```
+
+### Component Interaction
+```mermaid
+sequenceDiagram
+    participant User
+    participant UI
+    participant Forecast
+    participant Inventory
+    participant Storage
+    
+    User->>UI: Upload Excel
+    UI->>Forecast: Process Data
+    Forecast->>Inventory: Send Forecasts
+    Inventory->>UI: Return Policies
+    UI->>Storage: Save Results
+    Storage->>UI: Load Results
+    UI->>User: Display Analysis
+```
 
 ## Features
 
@@ -15,24 +58,41 @@ This Inventory Management System is a Streamlit-based web application designed t
 - **Supply and Demand Planning**: Visualization and analysis of supply plans and demand forecasts
 - **Customizable Parameters**: Adjustable lead times, service levels, costs, and more
 
-## Installation
+## 💻 Installation
 
-1. Clone this repository:
-   ```
-   git clone https://github.com/?
-   cd inventory-management-system
-   ```
+### Local Development
 
-2. Create a virtual environment (optional but recommended):
-   ```
-   python -m venv venv
-   source venv/bin/activate  # On Windows use `venv\Scripts\activate`
-   ```
+  ```bash
+  git clone https://github.com/yourusername/inventory-management-system
+  cd inventory-management-system
+  ```
 
-3. Install the required packages:
-   ```
-   pip install -r requirements.txt
-   ```
+  ```bash
+  python -m venv venv
+  source venv/bin/activate  # On Windows: venv\Scripts\activate
+  ```
+
+  ```bash
+  pip install -r requirements.txt
+  ```
+
+### Enterprise Deployment
+
+#### Docker Deployment
+  ```dockerfile
+  FROM python:3.8-slim
+
+  WORKDIR /app
+  COPY . /app
+
+  RUN pip install -r requirements.txt
+
+  EXPOSE 8501
+
+  HEALTHCHECK CMD curl --fail http://localhost:8501/_stcore/health
+
+  ENTRYPOINT ["streamlit", "run", "Home.py", "--server.port=8501", "--server.address=0.0.0.0"]
+  ```
 
 ## Running the Application
 
@@ -82,3 +142,28 @@ Main dependencies include:
 - Statsmodels
 
 For a complete list, see `requirements.txt`.
+
+# Cursor Context
+
+## Current Section
+- Documentation Enhancement
+- README.md improvements
+
+## Working Status
+- ✅ System architecture diagrams
+- ✅ Deployment instructions
+- ✅ Code formatting
+- ✅ Security considerations
+- ✅ Enterprise features
+
+## Current Blockers
+- None
+
+## Database/Model State
+- N/A (Documentation only)
+
+## Guide Implementation Progress
+- Added all major sections
+- Enhanced with visual diagrams
+- Included code examples
+- Added enterprise deployment instructions
