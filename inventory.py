@@ -485,16 +485,17 @@ class ModifiedContinuousReview(InventoryModel):
         if len(non_zero_sales) < 2:
             raise ValueError(f"Insufficient historical sales data. Found only {len(non_zero_sales)} non-zero sales points, minimum required is 2.")
             
-        # Existing calculation logic
+        # Calculate demand statistics
         annual_demand = np.sum(demand) * (52 / len(demand))
         annual_demand = max(annual_demand, 0.01)
         
         avg_weekly_demand = np.mean(demand)
-        std_weekly_demand = np.std(demand)
+        std_weekly_demand = max(np.std(demand), 0.1 * avg_weekly_demand)  # Ensure some variability
         
         lead_time = params['lead_time_weeks']
         review_period = params['review_period']
         
+        # Calculate demand during lead time plus review period
         protected_period = lead_time + review_period
         protected_period_demand = avg_weekly_demand * protected_period
         protected_period_std = std_weekly_demand * np.sqrt(protected_period)
@@ -505,6 +506,7 @@ class ModifiedContinuousReview(InventoryModel):
             np.ceil(np.percentile(non_zero_sales, 25))  # Use 25th percentile of non-zero sales only
         )
         
+        # Calculate EOQ
         if 'eoq' in params:
             order_quantity = max(params['eoq'], min_eoq)
         else:
@@ -522,39 +524,60 @@ class ModifiedContinuousReview(InventoryModel):
                     z * protected_period_std
                 )
         
-        # Calculate safety stock first
+        # Calculate safety stock based on service level and demand variability
         z = stats.norm.ppf(params['service_level'])
-        safety_stock = z * protected_period_std
         
-        # Then calculate reorder point using the safety stock
-        if 'reorder_point' in params:
-            reorder_point = max(params['reorder_point'], protected_period_demand)
-        else:
-            reorder_point = protected_period_demand + safety_stock  # ROP = D*L + SS
+        # Enhanced safety stock calculation considering:
+        # 1. Service level (through z-score)
+        # 2. Demand variability (std_weekly_demand)
+        # 3. Protected period (lead time + review period)
+        # 4. Minimum safety factor based on service level
+        min_safety_factor = max(0.5, (params['service_level'] - 0.5) * 2)  # Maps service level 0.5-1.0 to 0.5-1.0
+        
+        base_safety_stock = z * protected_period_std
+        min_safety_stock = min_safety_factor * avg_weekly_demand * np.sqrt(protected_period)
+        
+        safety_stock = max(
+            base_safety_stock,
+            min_safety_stock,
+            0.5 * avg_weekly_demand * review_period  # Minimum half of review period demand
+        )
+        
+        # Calculate reorder point - ALWAYS includes safety stock
+        reorder_point = protected_period_demand + safety_stock
+            
+        # Final validation to ensure logical relationships
+        safety_stock = max(safety_stock, 0.1 * reorder_point)  # Safety stock at least 10% of reorder point
+        reorder_point = protected_period_demand + safety_stock  # Recalculate to maintain relationship
         
         self.policy = {
-            'eoq': np.round(max(order_quantity, 1), 2),  # Ensure minimum of 1
-            'reorder_point': np.round(reorder_point, 2),
-            'safety_stock': np.round(safety_stock, 2)  # Use the directly calculated safety stock
+            'eoq': np.round(max(order_quantity, 1)),  # Ensure minimum of 1
+            'reorder_point': np.round(reorder_point),
+            'safety_stock': np.round(safety_stock)
         }
         
         return self.policy
 
     def _optimize_policy(self, demand, params):
         avg_weekly_demand = np.mean(demand)
-        std_weekly_demand = np.std(demand)
+        std_weekly_demand = max(np.std(demand), 0.1 * avg_weekly_demand)  # Ensure some variability
         lead_time = params['lead_time_weeks']
         review_period = params['review_period']
         protected_period = lead_time + review_period
         protected_period_demand = avg_weekly_demand * protected_period
         protected_period_std = std_weekly_demand * np.sqrt(protected_period)
 
-        mean_demand = np.mean(demand)
+        # First calculate base safety stock based on service level
+        z = stats.norm.ppf(params['service_level'])
+        base_safety_stock = z * protected_period_std
+        min_safety_stock = 0.5 * avg_weekly_demand * review_period
+        
+        # Define parameter ranges ensuring reorder point is always >= safety stock
         param_ranges = {
-            'eoq': (max(mean_demand * params['review_period'] * 0.5, 1), 
-                    mean_demand * params['review_period'] * 10),
-            'safety_stock': (0, protected_period_std * 3),  # Up to 3 sigma for safety stock
-            'reorder_point': (protected_period_demand, protected_period_demand * 3)
+            'eoq': (max(avg_weekly_demand * review_period * 0.5, 1), 
+                    avg_weekly_demand * review_period * 10),
+            'safety_stock': (max(base_safety_stock * 0.5, min_safety_stock),  # Minimum safety stock
+                           base_safety_stock * 2)  # Up to 2x the calculated safety stock
         }
         
         best_cost = float('inf')
@@ -564,7 +587,10 @@ class ModifiedContinuousReview(InventoryModel):
         # Generate grid of parameter combinations
         param_combinations = product(*[np.linspace(r[0], r[1], 10) for r in param_ranges.values()])
 
-        for eoq, safety_stock, reorder_point in param_combinations:
+        for eoq, safety_stock in param_combinations:
+            # Calculate reorder point based on safety stock
+            reorder_point = protected_period_demand + safety_stock
+            
             current_params = params.copy()
             current_params['eoq'] = np.round(eoq)
             current_params['safety_stock'] = np.round(safety_stock)
@@ -576,17 +602,18 @@ class ModifiedContinuousReview(InventoryModel):
                 'reorder_point': np.round(reorder_point)
             }
 
-            # Generate demand forecast
-            forecast_demand = np.random.normal(np.mean(demand), np.std(demand), params['periods'])
-
             # Simulate inventory
-            inventory, orders, stockouts, profits, _, _, unfufilled_demand = self.simulate(forecast_demand, params['periods'], current_params)
+            inventory, orders, stockouts, profits, _, _, unfufilled_demand = self.simulate(
+                np.random.normal(avg_weekly_demand, std_weekly_demand, params['periods']), 
+                params['periods'], 
+                current_params
+            )
 
-            # Calculate total cost
+            # Calculate total cost with higher penalty for stockouts
             total_cost = (
                 np.sum(inventory * params['holding_cost']) +
-                np.sum(orders > 0) * params['order_cost'] +  # Fixed cost per order
-                np.sum(unfufilled_demand) * params['stockout_cost']
+                np.sum(orders > 0) * params['order_cost'] +
+                np.sum(unfufilled_demand) * params['stockout_cost'] * 2  # Double penalty for stockouts
             )
 
             # Calculate service level
@@ -598,10 +625,17 @@ class ModifiedContinuousReview(InventoryModel):
                 best_policy = self.policy.copy()
 
         if best_policy is None:
-            # Use the initial policy if no feasible solution was found
-            best_policy = self.policy
-
+            # If no feasible solution found, calculate a safe default policy
+            safety_stock = max(base_safety_stock, min_safety_stock)
+            reorder_point = protected_period_demand + safety_stock
+            eoq = max(avg_weekly_demand * review_period, 1)
             
+            best_policy = {
+                'eoq': np.round(eoq),
+                'safety_stock': np.round(safety_stock),
+                'reorder_point': np.round(reorder_point)
+            }
+
         self.policy = best_policy
         return self.policy
 
@@ -668,33 +702,44 @@ class ModifiedContinuousReview(InventoryModel):
     @staticmethod
     def get_description():
         return """
-        Enhanced (r, Q) Periodic Review Policy
+        Enhanced (r, Q) Periodic Review Policy with Dynamic Safety Stock
 
-        This policy uses two main parameters:
-        - r (reorder point): When the inventory position (on-hand + on-order) reaches this point, an order is placed.
-        - Q (order quantity): The amount ordered each time, based on a modified Economic Order Quantity (EOQ).
+        This policy uses three main parameters:
+        - r (reorder point): When the inventory position (on-hand + on-order) reaches this point, an order is placed
+        - Q (order quantity): The amount ordered each time, based on a modified Economic Order Quantity (EOQ)
+        - SS (safety stock): Dynamic buffer stock that protects against demand variability and lead time uncertainty
 
         Key enhancements:
-        1. Considers both lead time and review period in calculations.
-        2. Uses a protected period (lead time + review period) for safety stock calculations.
-        3. Adjusts EOQ to be a multiple of review period demand.
-        4. Accounts for orders in transit in the inventory position calculation.
-        5. Only places orders on review periods.
+        1. Dynamic Safety Stock: Calculated based on:
+           - Service level requirements (higher service level = higher safety stock)
+           - Demand variability (more variable demand = higher safety stock)
+           - Protected period (lead time + review period)
+           - Minimum safety factor based on service level
+        
+        2. Protected Period Approach:
+           - Considers both lead time and review period in calculations
+           - Accounts for demand variability during the entire protected period
+           - Ensures safety stock never falls below critical thresholds
 
-        Key components:
-        - Modified EOQ: Q = ceil(√((2AD) / h) / (R * μ)) * R * μ
-        - Safety Stock: SS = z * σ * √(L + R)
+        3. Robust Optimization:
+           - Prevents zero or insufficient safety stock
+           - Maintains logical relationship between safety stock and reorder point
+           - Adapts to different demand patterns and service level requirements
+
+        Key formulas:
+        - Safety Stock: SS = max(z * σ * √(L + R), min_safety_factor * μ * √(L + R), 0.5 * μ * R)
         - Reorder Point: r = μ(L + R) + SS
+        - Modified EOQ: Q = ceil(√((2AD) / h) / (R * μ)) * R * μ
 
         Where:
-        - A: fixed cost per order
-        - D: annual demand
-        - h: holding cost per unit per year
         - z: safety factor based on service level
         - σ: standard deviation of weekly demand
         - L: lead time in weeks
         - R: review period in weeks
         - μ: average weekly demand
+        - A: fixed cost per order
+        - D: annual demand
+        - h: holding cost per unit per year
 
-        This enhanced version provides a more robust inventory management strategy by considering the interplay between review periods, lead times, and demand variability.
+        This enhanced version provides a more robust inventory management strategy by ensuring adequate safety stock levels while balancing holding costs and service level requirements.
         """

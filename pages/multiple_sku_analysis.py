@@ -533,14 +533,15 @@ def display_supply_demand_plan(supply_plan_df, results_df):
             hovertemplate="Arriving Quantity: %{y}<br>Date: %{x}<extra></extra>"
         ))
     
-    # Add Reorder Point if viewing a single SKU
+    # Add Reorder Point and Safety Stock if viewing a single SKU
     if selected_sku != 'All SKUs':
         sku_policy = dict(zip(results_df['SKU'], 
                             zip(results_df['EOQ'], 
                                 results_df['Reorder Point'],
                                 results_df['Safety Stock']))).get(selected_sku)
         if sku_policy:
-            _, reorder_point, _ = sku_policy
+            _, reorder_point, safety_stock = sku_policy
+            # Add Reorder Point line
             fig.add_trace(go.Scatter(
                 x=daily_plan['Date'],
                 y=[reorder_point] * len(daily_plan),
@@ -548,6 +549,32 @@ def display_supply_demand_plan(supply_plan_df, results_df):
                 name='Reorder Point',
                 line=dict(dash='dot', color='red')
             ))
+            # Add Safety Stock line
+            fig.add_trace(go.Scatter(
+                x=daily_plan['Date'],
+                y=[safety_stock] * len(daily_plan),
+                mode='lines',
+                name='Safety Stock',
+                line=dict(dash='dot', color='orange')
+            ))
+            
+            # Add annotations for both lines
+            fig.add_annotation(
+                x=daily_plan['Date'].iloc[-1],
+                y=reorder_point,
+                text=f"Reorder Point: {reorder_point:.0f}",
+                showarrow=False,
+                yshift=10,
+                xshift=10
+            )
+            fig.add_annotation(
+                x=daily_plan['Date'].iloc[-1],
+                y=safety_stock,
+                text=f"Safety Stock: {safety_stock:.0f}",
+                showarrow=False,
+                yshift=-10,
+                xshift=10
+            )
     
     fig.update_layout(
         title=f"Supply and Demand Plan{title_suffix}",
