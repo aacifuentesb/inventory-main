@@ -37,33 +37,7 @@ st.markdown("""
     </style>
 """, unsafe_allow_html=True)
 
-def display_sidebar():
-    with st.sidebar:
-        st.markdown("### 📊 Navigation")
-        st.markdown("---")
-        st.markdown("#### Analysis Tools")
-        if st.button("🏠 Home", use_container_width=True):
-            st.switch_page("Home.py")
-        if st.button("📈 Single SKU Analysis", use_container_width=True):
-            st.switch_page("pages/single_sku_analysis.py")
-        if st.button("📊 Multiple SKU Analysis", use_container_width=True):
-            st.switch_page("pages/multiple_sku_analysis.py")
-        
-        st.markdown("---")
-        if 'results_df' in st.session_state:
-            st.markdown("#### Analysis Sections")
-            sections = {
-                "Global Analysis": "🌐",
-                "ABC Analysis": "📊",
-                "Category Analysis": "📑",
-                "Download Report": "💾"
-            }
-            selected_section = st.radio(
-                "Go to section:",
-                sections.keys(),
-                format_func=lambda x: f"{sections[x]} {x}"
-            )
-            st.session_state.selected_section = selected_section
+
 
 def display_logo_and_title():
     logo_base64 = get_base64_of_bin_file("logo.svg")
@@ -167,7 +141,11 @@ def run_multiple_sku_analysis(historic_data, master_data, periods):
     # Convert QTY to numeric in historic data
     historic_data['QTY'] = pd.to_numeric(historic_data['QTY'], errors='coerce')
     
-    skipped_skus = []
+    skipped_skus = {
+        'No Historical Data': [],
+        'Insufficient Sales Data': [],
+        'Processing Errors': []
+    }
     
     for idx, sku_params in master_data.iterrows():
         try:
@@ -178,15 +156,17 @@ def run_multiple_sku_analysis(historic_data, master_data, periods):
             # Get SKU data
             sku_data = historic_data[historic_data['SKU'] == sku_params['SKU']].copy()
             
-            # Skip if no historical data or less than 2 sales points
+            # Skip if no historical data
             if len(sku_data) == 0:
-                skipped_skus.append(f"No historical data found for SKU {sku_params['SKU']}")
+                skipped_skus['No Historical Data'].append(sku_params['SKU'])
                 continue
                 
             # Count non-zero sales points
             non_zero_sales = len(sku_data[sku_data['QTY'] > 0])
             if non_zero_sales < 2:
-                skipped_skus.append(f"Insufficient sales data for SKU {sku_params['SKU']} (only {non_zero_sales} sales points)")
+                skipped_skus['Insufficient Sales Data'].append(
+                    f"{sku_params['SKU']} (only {non_zero_sales} sales points)"
+                )
                 continue
             
             # Ensure all parameters are numeric
@@ -250,17 +230,20 @@ def run_multiple_sku_analysis(historic_data, master_data, periods):
                 supply_plans.append(supply_plan)
             
         except Exception as e:
-            skipped_skus.append(f"Error processing SKU {sku_params['SKU']}: {str(e)}")
+            skipped_skus['Processing Errors'].append(f"{sku_params['SKU']}: {str(e)}")
             continue
     
     progress_bar.empty()
     status_text.empty()
     
     # Display summary of skipped SKUs if any
-    if skipped_skus:
-        st.warning("Summary of skipped SKUs:")
-        for msg in skipped_skus:
-            st.write(msg)
+    if any(skipped_skus.values()):
+        with st.expander("⚠️ Summary of Skipped SKUs", expanded=False):
+            for category, skus in skipped_skus.items():
+                if skus:
+                    st.markdown(f"**{category}** ({len(skus)} SKUs)")
+                    for sku in skus:
+                        st.markdown(f"- {sku}")
     
     if not results:
         st.error("No SKUs were processed successfully")
@@ -1055,7 +1038,16 @@ def display_syntetos_categorization(historic_data, master_data):
     st.dataframe(styled_df, use_container_width=True)
 
 def main():
+    # Initialize session state variables
+    if 'analysis_run' not in st.session_state:
+        st.session_state.analysis_run = False
+    if 'show_results' not in st.session_state:
+        st.session_state.show_results = False
+    if 'file_processed' not in st.session_state:
+        st.session_state.file_processed = False
+    
     display_logo_and_title()
+    ()
     
     st.markdown("""
     ## Multiple SKU Analysis
@@ -1065,35 +1057,27 @@ def main():
     2. **Master Data**: Parameters for each SKU
     """)
     
-    # Initialize session state for storing analysis results
-    if 'historic_data' not in st.session_state:
-        st.session_state.historic_data = None
-    if 'master_data' not in st.session_state:
-        st.session_state.master_data = None
-    if 'results_df' not in st.session_state:
-        st.session_state.results_df = None
-    if 'supply_plan_df' not in st.session_state:
-        st.session_state.supply_plan_df = None
-    if 'warnings_container' not in st.session_state:
-        st.session_state.warnings_container = None
-    if 'seasonality_extracted' not in st.session_state:
-        st.session_state.seasonality_extracted = 0
-    
     uploaded_file = st.file_uploader("Upload Excel file", type=['xlsx'])
     
     if uploaded_file is not None:
-        # Only load data if it hasn't been loaded or if a new file is uploaded
+        # Process file only if it's new or hasn't been processed
         file_contents = uploaded_file.getvalue()
-        if 'current_file_hash' not in st.session_state or \
-           st.session_state.current_file_hash != hash(file_contents):
+        current_file_hash = hash(file_contents)
+        
+        if not st.session_state.file_processed or \
+           ('current_file_hash' not in st.session_state) or \
+           (st.session_state.current_file_hash != current_file_hash):
+            
             historic_data, master_data = load_data(uploaded_file)
+            
             if historic_data is not None and master_data is not None:
                 st.session_state.historic_data = historic_data
                 st.session_state.master_data = master_data
-                st.session_state.current_file_hash = hash(file_contents)
+                st.session_state.current_file_hash = current_file_hash
+                st.session_state.file_processed = True
                 st.success("File loaded successfully!")
         
-        if st.session_state.historic_data is not None and st.session_state.master_data is not None:
+        if st.session_state.file_processed:
             # Display data preview
             st.subheader("Data Preview")
             col1, col2 = st.columns(2)
@@ -1107,20 +1091,18 @@ def main():
             # Get forecast periods
             periods = st.number_input("Forecast Periods (weeks)", min_value=1, value=52)
             
-            # Create a container for warnings that can be cleared
-            if st.session_state.warnings_container is None:
-                st.session_state.warnings_container = st.empty()
+            # Create a placeholder for warnings
+            warnings_placeholder = st.empty()
             
-            run_analysis = st.button("Run Analysis")
-            
-            # Only run analysis if button is clicked
-            if run_analysis:
+            if st.button("Run Analysis"):
+                st.session_state.analysis_run = True
+                
                 with st.spinner("Running analysis for all SKUs..."):
                     # Clear previous warnings
-                    st.session_state.warnings_container.empty()
+                    warnings_placeholder.empty()
                     
-                    # Create a new container for warnings during this run
-                    with st.session_state.warnings_container.container():
+                    # Run analysis within the warnings placeholder
+                    with warnings_placeholder.container():
                         results_df, supply_plan_df = run_multiple_sku_analysis(
                             st.session_state.historic_data,
                             st.session_state.master_data,
@@ -1130,36 +1112,41 @@ def main():
                     # Store results in session state
                     st.session_state.results_df = results_df
                     st.session_state.supply_plan_df = supply_plan_df
+                    st.session_state.show_results = True
             
-            # Display results if they exist in session state
-            if st.session_state.results_df is not None and not st.session_state.results_df.empty:
-                # Create tabs for different views
-                tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
-                    "📊 Overall Metrics",
-                    "📈 Supply & Demand Plan",
-                    "🔮 Forecast Analysis",
-                    "📅 Weekly Analysis",
-                    "🎯 Categorization",
-                    "💾 Download Results"
-                ])
+            # Display results if they exist and should be shown
+            if st.session_state.show_results and 'results_df' in st.session_state:
+                results_df = st.session_state.results_df
+                supply_plan_df = st.session_state.supply_plan_df
                 
-                with tab1:
-                    display_overall_metrics(st.session_state.results_df)
-                
-                with tab2:
-                    display_supply_demand_plan(st.session_state.supply_plan_df, st.session_state.results_df)
-                
-                with tab3:
-                    display_forecast_analysis(st.session_state.results_df, st.session_state.supply_plan_df)
-                
-                with tab4:
-                    display_weekly_analysis(st.session_state.supply_plan_df, st.session_state.results_df)
-                
-                with tab5:
-                    display_syntetos_categorization(st.session_state.historic_data, st.session_state.master_data)
-                
-                with tab6:
-                    display_download_section(st.session_state.results_df, st.session_state.supply_plan_df, st.session_state.master_data)
+                if not results_df.empty:
+                    # Create tabs for different views
+                    tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
+                        "📊 Overall Metrics",
+                        "📈 Supply & Demand Plan",
+                        "🔮 Forecast Analysis",
+                        "📅 Weekly Analysis",
+                        "🎯 Categorization",
+                        "💾 Download Results"
+                    ])
+                    
+                    with tab1:
+                        display_overall_metrics(results_df)
+                    
+                    with tab2:
+                        display_supply_demand_plan(supply_plan_df, results_df)
+                    
+                    with tab3:
+                        display_forecast_analysis(results_df, supply_plan_df)
+                    
+                    with tab4:
+                        display_weekly_analysis(supply_plan_df, results_df)
+                    
+                    with tab5:
+                        display_syntetos_categorization(st.session_state.historic_data, st.session_state.master_data)
+                    
+                    with tab6:
+                        display_download_section(results_df, supply_plan_df, st.session_state.master_data)
 
 if __name__ == "__main__":
     main() 
