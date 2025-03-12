@@ -117,7 +117,46 @@ def load_data(file):
         st.error(f"Error loading data: {str(e)}")
         return None, None
 
-def run_multiple_sku_analysis(historic_data, master_data, periods, batch_size=20):
+def is_sku_suitable_for_optimization(sku):
+    """
+    Check if a SKU is suitable for optimization based on its data characteristics.
+    
+    Args:
+        sku: The SKU object to check
+        
+    Returns:
+        bool: True if the SKU is suitable for optimization, False otherwise
+        str: A message explaining why the SKU is not suitable, or None if it is suitable
+    """
+    # Check if there's enough data
+    if len(sku.data) < 10:
+        return False, "Insufficient historical data points"
+    
+    # Check if there's enough non-zero demand
+    non_zero_demand = np.sum(sku.data > 0)
+    if non_zero_demand < 5:
+        return False, "Insufficient non-zero demand points"
+    
+    # Check if the data is too variable
+    cv = np.std(sku.data) / np.mean(sku.data) if np.mean(sku.data) > 0 else float('inf')
+    if cv > 8:
+        return False, "Demand is too variable (CV > 5)"
+    
+    # Check if the forecast is reasonable
+    if not hasattr(sku, 'forecast') or sku.forecast is None or 'mean' not in sku.forecast:
+        return False, "Forecast not available"
+    
+    if len(sku.forecast['mean']) == 0:
+        return False, "Empty forecast"
+    
+    # Check if the inventory policy has the necessary parameters
+    required_params = ['eoq', 'reorder_point', 'safety_stock']
+    if not all(param in sku.inventory_policy for param in required_params):
+        return False, "Missing required inventory policy parameters"
+    
+    return True, None
+
+def run_multiple_sku_analysis(historic_data, master_data, periods, batch_size=20, optimization_params=None):
     results = []
     supply_plans = []
     # Reset seasonality counter at the start of each analysis
@@ -131,6 +170,29 @@ def run_multiple_sku_analysis(historic_data, master_data, periods, batch_size=20
     )
     
     inventory_model = ModifiedContinuousReview()
+    
+    # Check if optimization is enabled
+    is_optimization_enabled = optimization_params is not None
+    
+    # If optimization is enabled, import the optimization module
+    if is_optimization_enabled:
+        try:
+            from optimization import monte_carlo_optimization
+            optimization_module_available = True
+        except ImportError:
+            st.error("Optimization module could not be imported. Using default inventory policies instead.")
+            optimization_module_available = False
+        
+        # Set default values if not provided
+        if 'num_param_combinations' not in optimization_params:
+            optimization_params['num_param_combinations'] = 50
+        if 'num_demand_scenarios' not in optimization_params:
+            optimization_params['num_demand_scenarios'] = 100
+        if 'objective_function' not in optimization_params:
+            optimization_params['objective_function'] = 'Minimize Total Cost'
+        
+        if optimization_module_available:
+            st.info(f"Optimization enabled with {optimization_params['num_param_combinations']} parameter combinations and {optimization_params['num_demand_scenarios']} demand scenarios.")
     
     progress_bar = st.progress(0)
     status_text = st.empty()
@@ -225,6 +287,40 @@ def run_multiple_sku_analysis(historic_data, master_data, periods, batch_size=20
                     if forecast_model.seasonality_extracted:
                         st.session_state.seasonality_extracted += 1
                     
+                    # Optimize inventory policy if enabled
+                    if is_optimization_enabled and optimization_module_available:
+                        status_text.text(f"Optimizing inventory policy for SKU {sku_params['SKU']} ({start_idx + i + 1}/{total_skus})")
+                        
+                        # Check if SKU is suitable for optimization
+                        is_suitable, unsuitable_reason = is_sku_suitable_for_optimization(sku)
+                        
+                        if not is_suitable:
+                            st.warning(f"Skipping optimization for SKU {sku_params['SKU']}: {unsuitable_reason}. Using default policy instead.")
+                        else:
+                            try:
+                                # Run Monte Carlo optimization
+                                best_policy, best_metric, top_10_policies = monte_carlo_optimization(
+                                    sku,
+                                    num_param_combinations=optimization_params['num_param_combinations'],
+                                    num_demand_scenarios=optimization_params['num_demand_scenarios'],
+                                    target_service_level=params['service_level'],
+                                    optimization_model='Soft Constraint',
+                                    objective_function=optimization_params['objective_function']
+                                )
+                                
+                                # Update the inventory policy with the optimized parameters
+                                if best_policy is not None:
+                                    sku.update_inventory_policy(best_policy)
+                                    
+                                    # Re-simulate with the optimized policy
+                                    sku.simulate_inventory(sku.forecast['mean'], len(sku.forecast['mean']))
+                            except ValueError as e:
+                                st.warning(f"Optimization failed for SKU {sku_params['SKU']}: Value error - {str(e)}. Using default policy instead.")
+                            except TypeError as e:
+                                st.warning(f"Optimization failed for SKU {sku_params['SKU']}: Type error - {str(e)}. Using default policy instead.")
+                            except Exception as e:
+                                st.warning(f"Optimization failed for SKU {sku_params['SKU']}: {str(e)}. Using default policy instead.")
+                    
                     # Collect results
                     results.append({
                         'SKU': sku_params['SKU'],
@@ -240,7 +336,8 @@ def run_multiple_sku_analysis(historic_data, master_data, periods, batch_size=20
                         'EOQ': float(sku.inventory_policy.get('eoq', 0)),
                         'Reorder Point': float(sku.inventory_policy.get('reorder_point', 0)),
                         'Safety Stock': float(sku.inventory_policy.get('safety_stock', 0)),
-                        'Seasonality Extracted': forecast_model.seasonality_extracted
+                        'Seasonality Extracted': forecast_model.seasonality_extracted,
+                        'Optimized': is_optimization_enabled
                     })
                     
                     # Collect supply plan
@@ -391,6 +488,9 @@ def generate_excel_report(results_df, supply_plan_df, master_data):
     # Merge categories with results
     results_df = results_df.merge(categories_df, on='SKU', how='left')
     
+    # Check if optimization was used
+    optimization_used = 'Optimized' in results_df.columns and results_df['Optimized'].any()
+    
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine='openpyxl') as writer:
         # Summary Results with categories
@@ -410,6 +510,7 @@ def generate_excel_report(results_df, supply_plan_df, master_data):
                 'Forecast Rolling Window',
                 'Forecast Zero Train Strategy',
                 'Inventory Model',
+                'Optimization Used',
                 'Description'
             ],
             'Value': [
@@ -418,12 +519,61 @@ def generate_excel_report(results_df, supply_plan_df, master_data):
                 '4',
                 'mean',
                 'Modified Continuous Review',
+                'Yes' if optimization_used else 'No',
                 'The Modified Continuous Review model is used for inventory management. ' +
                 'It combines features of continuous review with periodic adjustments. ' +
-                'The forecast model uses Normal Distribution with rolling mean for zero demand handling.'
+                'The forecast model uses Normal Distribution with rolling mean for zero demand handling.' +
+                (' Inventory policies were optimized using Monte Carlo simulation.' if optimization_used else '')
             ]
         })
         model_params.to_excel(writer, sheet_name='Model Parameters', index=False)
+        
+        # If optimization was used, add optimization results comparison
+        if optimization_used and not results_df['Optimized'].all():
+            optimized = results_df[results_df['Optimized']].copy()
+            non_optimized = results_df[~results_df['Optimized']].copy()
+            
+            # Create comparison dataframe
+            comparison_df = pd.DataFrame({
+                'Metric': [
+                    'Average Service Level',
+                    'Average Inventory',
+                    'Total Cost',
+                    'Total Sales',
+                    'Average Stockout Rate',
+                    'Average Inventory Turnover',
+                    'Number of SKUs'
+                ],
+                'Optimized': [
+                    f"{optimized['Service Level'].mean():.2%}",
+                    f"{optimized['Average Inventory'].mean():.1f}",
+                    f"${optimized['Total Cost'].sum():,.2f}",
+                    f"${optimized['Total Sales'].sum():,.2f}",
+                    f"{optimized['Stockout Rate'].mean():.2%}",
+                    f"{optimized['Inventory Turnover'].mean():.2f}",
+                    len(optimized)
+                ],
+                'Default': [
+                    f"{non_optimized['Service Level'].mean():.2%}",
+                    f"{non_optimized['Average Inventory'].mean():.1f}",
+                    f"${non_optimized['Total Cost'].sum():,.2f}",
+                    f"${non_optimized['Total Sales'].sum():,.2f}",
+                    f"{non_optimized['Stockout Rate'].mean():.2%}",
+                    f"{non_optimized['Inventory Turnover'].mean():.2f}",
+                    len(non_optimized)
+                ],
+                'Difference': [
+                    f"{optimized['Service Level'].mean() - non_optimized['Service Level'].mean():.2%}",
+                    f"{optimized['Average Inventory'].mean() - non_optimized['Average Inventory'].mean():.1f}",
+                    f"${optimized['Total Cost'].sum() - non_optimized['Total Cost'].sum():,.2f}",
+                    f"${optimized['Total Sales'].sum() - non_optimized['Total Sales'].sum():,.2f}",
+                    f"{optimized['Stockout Rate'].mean() - non_optimized['Stockout Rate'].mean():.2%}",
+                    f"{optimized['Inventory Turnover'].mean() - non_optimized['Inventory Turnover'].mean():.2f}",
+                    ""
+                ]
+            })
+            
+            comparison_df.to_excel(writer, sheet_name='Optimization Comparison', index=False)
         
         # Create a template for future runs
         template = pd.DataFrame({
@@ -476,13 +626,80 @@ def display_overall_metrics(results_df):
         col5.metric("Seasonality Extraction", f"{success_rate:.1f}%", 
                    f"{st.session_state.seasonality_extracted}/{len(results_df)} SKUs")
     
+    # Check if optimization was used
+    if 'Optimized' in results_df.columns and results_df['Optimized'].any():
+        st.success("✅ Inventory policies have been optimized for all SKUs.")
+        
+        # If we have both optimized and non-optimized results, show comparison
+        if not results_df['Optimized'].all():
+            optimized = results_df[results_df['Optimized']].copy()
+            non_optimized = results_df[~results_df['Optimized']].copy()
+            
+            # Create comparison metrics
+            comparison_cols = st.columns(4)
+            
+            # Service Level comparison
+            service_level_diff = optimized['Service Level'].mean() - non_optimized['Service Level'].mean()
+            comparison_cols[0].metric(
+                "Service Level (Optimized vs Default)",
+                f"{optimized['Service Level'].mean():.2%}",
+                f"{service_level_diff:.2%}",
+                delta_color="normal"
+            )
+            
+            # Inventory comparison
+            inventory_diff = optimized['Average Inventory'].mean() - non_optimized['Average Inventory'].mean()
+            comparison_cols[1].metric(
+                "Average Inventory (Optimized vs Default)",
+                f"{optimized['Average Inventory'].mean():.1f}",
+                f"{inventory_diff:.1f}",
+                delta_color="inverse"  # Lower inventory is better
+            )
+            
+            # Cost comparison
+            cost_diff = optimized['Total Cost'].sum() - non_optimized['Total Cost'].sum()
+            comparison_cols[2].metric(
+                "Total Cost (Optimized vs Default)",
+                f"${optimized['Total Cost'].sum():,.2f}",
+                f"${cost_diff:,.2f}",
+                delta_color="inverse"  # Lower cost is better
+            )
+            
+            # Stockout comparison
+            stockout_diff = optimized['Stockout Rate'].mean() - non_optimized['Stockout Rate'].mean()
+            comparison_cols[3].metric(
+                "Stockout Rate (Optimized vs Default)",
+                f"{optimized['Stockout Rate'].mean():.2%}",
+                f"{stockout_diff:.2%}",
+                delta_color="inverse"  # Lower stockout rate is better
+            )
+    
     # Global analysis dashboard
     st.plotly_chart(plot_global_analysis(results_df), use_container_width=True)
     
     # Detailed results table with sorting and filtering
     st.subheader("Detailed Results")
+    
+    # Add a filter for optimized vs non-optimized if applicable
+    if 'Optimized' in results_df.columns and results_df['Optimized'].any() and not results_df['Optimized'].all():
+        filter_option = st.radio(
+            "Filter results:",
+            options=["All SKUs", "Optimized Only", "Default Only"],
+            horizontal=True
+        )
+        
+        if filter_option == "Optimized Only":
+            display_df = results_df[results_df['Optimized']].copy()
+        elif filter_option == "Default Only":
+            display_df = results_df[~results_df['Optimized']].copy()
+        else:
+            display_df = results_df.copy()
+    else:
+        display_df = results_df.copy()
+    
+    # Format the dataframe for display
     st.dataframe(
-        results_df.style.format({
+        display_df.style.format({
             'Service Level': '{:.2%}',
             'Average Inventory': '{:.1f}',
             'Total Cost': '${:,.2f}',
@@ -499,6 +716,9 @@ def display_overall_metrics(results_df):
 def display_supply_demand_plan(supply_plan_df, results_df):
     st.subheader("Supply and Demand Analysis")
     
+    # Check if optimization was used
+    optimization_used = 'Optimized' in results_df.columns and results_df['Optimized'].any()
+    
     # SKU filter
     selected_sku = st.selectbox(
         "Select SKU for detailed view",
@@ -510,6 +730,13 @@ def display_supply_demand_plan(supply_plan_df, results_df):
         filtered_plan = supply_plan_df[supply_plan_df['SKU'] == selected_sku]
         filtered_results = results_df[results_df['SKU'] == selected_sku]
         title_suffix = f" - {selected_sku}"
+        
+        # Show optimization status for the selected SKU
+        if optimization_used and len(filtered_results) > 0:
+            if filtered_results['Optimized'].iloc[0]:
+                st.success(f"✅ Inventory policy for {selected_sku} has been optimized.")
+            else:
+                st.info(f"ℹ️ Using default inventory policy for {selected_sku}.")
     else:
         # When "All SKUs" is selected, limit to a subset of SKUs to prevent memory issues
         max_skus_to_display = 5  # Limit to 5 SKUs at a time
@@ -547,10 +774,22 @@ def display_supply_demand_plan(supply_plan_df, results_df):
             filtered_plan = supply_plan_df[supply_plan_df['SKU'].isin(selected_skus)]
             filtered_results = results_df[results_df['SKU'].isin(selected_skus)]
             title_suffix = f" - Page {page_number}/{total_pages}"
+            
+            # Show optimization status for the selected SKUs
+            if optimization_used:
+                optimized_count = filtered_results['Optimized'].sum()
+                if optimized_count > 0:
+                    st.success(f"✅ {optimized_count} of {len(filtered_results)} SKUs on this page have optimized inventory policies.")
         else:
             filtered_plan = supply_plan_df
             filtered_results = results_df
             title_suffix = " - All SKUs"
+            
+            # Show optimization status for all SKUs
+            if optimization_used:
+                optimized_count = filtered_results['Optimized'].sum()
+                if optimized_count > 0:
+                    st.success(f"✅ {optimized_count} of {len(filtered_results)} SKUs have optimized inventory policies.")
     
     # Check if the filtered data is too large
     if len(filtered_plan) > 100000:
@@ -668,6 +907,10 @@ def display_supply_demand_plan(supply_plan_df, results_df):
                 yshift=-10,
                 xshift=10
             )
+            
+            # Add optimization status to title if applicable
+            if optimization_used and filtered_results['Optimized'].iloc[0]:
+                title_suffix += " (Optimized)"
     
     fig.update_layout(
         title=f"Supply and Demand Plan{title_suffix}",
@@ -1347,6 +1590,13 @@ def main():
             with col1:
                 # Get forecast periods
                 periods = st.number_input("Forecast Periods (weeks)", min_value=1, value=52)
+                
+                # Add optimization option
+                optimize_inventory = st.checkbox(
+                    "Optimize Inventory Policies", 
+                    value=False,
+                    help="When enabled, the system will optimize inventory policies for each SKU instead of using default calculations."
+                )
             
             with col2:
                 # Add batch size control
@@ -1358,6 +1608,44 @@ def main():
                     value=min(20, total_skus),
                     step=5,
                     help="Process SKUs in smaller batches to reduce memory usage. Lower values use less memory but may take longer."
+                )
+            
+            # Optimization parameters (only show if optimization is enabled)
+            if optimize_inventory:
+                st.subheader("Optimization Parameters")
+                
+                col1, col2, col3 = st.columns(3)
+                
+                with col1:
+                    num_param_combinations = st.number_input(
+                        "Parameter Combinations", 
+                        min_value=10, 
+                        max_value=500, 
+                        value=50,
+                        help="Number of parameter combinations to evaluate during optimization. Higher values may find better solutions but take longer."
+                    )
+                
+                with col2:
+                    num_demand_scenarios = st.number_input(
+                        "Demand Scenarios", 
+                        min_value=10, 
+                        max_value=1000, 
+                        value=100,
+                        help="Number of demand scenarios to simulate for each parameter combination. Higher values provide more robust results but take longer."
+                    )
+                
+                with col3:
+                    optimization_objective = st.selectbox(
+                        "Optimization Objective",
+                        options=["Minimize Total Cost", "Maximize Profit", "Balance Cost and Service Level"],
+                        index=0,
+                        help="The objective function to optimize for."
+                    )
+                
+                # Warning about optimization time
+                st.warning(
+                    f"Optimization will evaluate {num_param_combinations} parameter combinations across {num_demand_scenarios} demand scenarios for each SKU. "
+                    f"This may take significantly longer than standard analysis. Consider reducing the batch size if you encounter memory issues."
                 )
             
             # Memory usage warning
@@ -1375,13 +1663,23 @@ def main():
                     # Clear previous warnings
                     warnings_placeholder.empty()
                     
+                    # Prepare optimization parameters if enabled
+                    optimization_params = None
+                    if optimize_inventory:
+                        optimization_params = {
+                            'num_param_combinations': num_param_combinations,
+                            'num_demand_scenarios': num_demand_scenarios,
+                            'objective_function': optimization_objective
+                        }
+                    
                     # Run analysis within the warnings placeholder
                     with warnings_placeholder.container():
                         results_df, supply_plan_df = run_multiple_sku_analysis(
                             st.session_state.historic_data,
                             st.session_state.master_data,
                             periods,
-                            batch_size
+                            batch_size,
+                            optimization_params
                         )
                     
                     # Store results in session state

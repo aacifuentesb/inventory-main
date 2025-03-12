@@ -236,11 +236,14 @@ def get_param_ranges(sku):
         max_eoq = max(sku.data) * sku.params["review_period"] * 2
         min_reorder_point = int(lead_time * min(sku.data))
         max_reorder_point = int(lead_time * max(sku.data)) * 2
+        min_target = max_reorder_point
+        max_target = max_reorder_point + max_eoq
 
         return {
             'eoq': (min_eoq, max_eoq),
             'reorder_point': (min_reorder_point, max_reorder_point),
-            'safety_stock': (0, safety_stock_max)
+            'safety_stock': (0, safety_stock_max),
+            'target_level': (min_target, max_target)
         }
 
     else:
