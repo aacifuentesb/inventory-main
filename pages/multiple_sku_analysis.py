@@ -105,13 +105,19 @@ def load_data(file):
         else:
             master_data['stockout_cost'] = master_data['stockout_cost'].fillna(master_data['cost'] * 0.1)
         
+        # Optimize memory usage
+        historic_data, hist_reduction = optimize_dataframe_memory(historic_data)
+        master_data, master_reduction = optimize_dataframe_memory(master_data)
+        
+        st.info(f"Memory optimization: Historic data reduced by {hist_reduction:.1f}%, Master data reduced by {master_reduction:.1f}%")
+        
         return historic_data, master_data
     
     except Exception as e:
         st.error(f"Error loading data: {str(e)}")
         return None, None
 
-def run_multiple_sku_analysis(historic_data, master_data, periods):
+def run_multiple_sku_analysis(historic_data, master_data, periods, batch_size=20):
     results = []
     supply_plans = []
     # Reset seasonality counter at the start of each analysis
@@ -147,91 +153,124 @@ def run_multiple_sku_analysis(historic_data, master_data, periods):
         'Processing Errors': []
     }
     
-    for idx, sku_params in master_data.iterrows():
-        try:
-            progress = (idx + 1) / len(master_data)
-            progress_bar.progress(progress)
-            status_text.text(f"Processing SKU {sku_params['SKU']} ({idx + 1}/{len(master_data)})")
-            
-            # Get SKU data
-            sku_data = historic_data[historic_data['SKU'] == sku_params['SKU']].copy()
-            
-            # Skip if no historical data
-            if len(sku_data) == 0:
-                skipped_skus['No Historical Data'].append(sku_params['SKU'])
-                continue
+    # Calculate total number of batches
+    total_skus = len(master_data)
+    num_batches = (total_skus + batch_size - 1) // batch_size  # Ceiling division
+    
+    # Process SKUs in batches
+    for batch_idx in range(num_batches):
+        start_idx = batch_idx * batch_size
+        end_idx = min((batch_idx + 1) * batch_size, total_skus)
+        
+        batch_master_data = master_data.iloc[start_idx:end_idx]
+        
+        # Update progress bar for this batch
+        batch_progress_start = batch_idx / num_batches
+        batch_progress_end = (batch_idx + 1) / num_batches
+        
+        status_text.text(f"Processing batch {batch_idx + 1}/{num_batches} (SKUs {start_idx + 1}-{end_idx} of {total_skus})")
+        
+        batch_supply_plans = []  # Store supply plans for this batch
+        
+        # Process each SKU in the batch
+        for i, (idx, sku_params) in enumerate(batch_master_data.iterrows()):
+            try:
+                # Calculate overall progress
+                progress = batch_progress_start + (i + 1) / len(batch_master_data) * (batch_progress_end - batch_progress_start)
+                progress_bar.progress(progress)
+                status_text.text(f"Processing SKU {sku_params['SKU']} ({start_idx + i + 1}/{total_skus})")
                 
-            # Count non-zero sales points
-            non_zero_sales = len(sku_data[sku_data['QTY'] > 0])
-            if non_zero_sales < 2:
-                skipped_skus['Insufficient Sales Data'].append(
-                    f"{sku_params['SKU']} (only {non_zero_sales} sales points)"
+                # Get SKU data
+                sku_data = historic_data[historic_data['SKU'] == sku_params['SKU']].copy()
+                
+                # Skip if no historical data
+                if len(sku_data) == 0:
+                    skipped_skus['No Historical Data'].append(sku_params['SKU'])
+                    continue
+                    
+                # Count non-zero sales points
+                non_zero_sales = len(sku_data[sku_data['QTY'] > 0])
+                if non_zero_sales < 2:
+                    skipped_skus['Insufficient Sales Data'].append(
+                        f"{sku_params['SKU']} (only {non_zero_sales} sales points)"
+                    )
+                    continue
+                
+                # Ensure all parameters are numeric
+                params = {
+                    'periods': int(periods),
+                    'lead_time_weeks': int(sku_params['lead_time_weeks']),
+                    'initial_inventory': int(sku_params['initial_inventory']),
+                    'service_level': float(sku_params['service_level']),
+                    'order_cost': float(sku_params['order_cost']),
+                    'holding_cost': float(sku_params['holding_cost']),
+                    'cost': float(sku_params['cost']),
+                    'price': float(sku_params['price']),
+                    'review_period': int(sku_params['review_period']),
+                    'stockout_cost': float(sku_params['stockout_cost'])
+                }
+                
+                # Get start time (first sale date)
+                start_time = sku_data['Date'].min()
+                
+                # Run simulation
+                sku = run_inventory_system(
+                    sku_data, sku_params['SKU'], params,
+                    forecast_model, inventory_model,
+                    params['periods'], start_time
                 )
+                
+                if sku is not None:
+                    # Update seasonality counter if seasonality was extracted
+                    if forecast_model.seasonality_extracted:
+                        st.session_state.seasonality_extracted += 1
+                    
+                    # Collect results
+                    results.append({
+                        'SKU': sku_params['SKU'],
+                        'Service Level': 1 - float(np.mean(sku.stockouts)),
+                        'Average Inventory': float(np.mean(sku.inventory_evolution)),
+                        'Total Cost': float(np.sum(sku.inventory_evolution * params['holding_cost'] + 
+                                           sku.order_evolution * params['cost'])),
+                        'Total Sales': float(np.sum(np.minimum(sku.inventory_evolution, sku.demand_evolution) * 
+                                            params['price'])),
+                        'Stockout Rate': float(np.mean(sku.stockouts)),
+                        'Inventory Turnover': float(np.sum(sku.demand_evolution) / 
+                                            np.mean(sku.inventory_evolution)) if np.mean(sku.inventory_evolution) > 0 else 0,
+                        'EOQ': float(sku.inventory_policy.get('eoq', 0)),
+                        'Reorder Point': float(sku.inventory_policy.get('reorder_point', 0)),
+                        'Safety Stock': float(sku.inventory_policy.get('safety_stock', 0)),
+                        'Seasonality Extracted': forecast_model.seasonality_extracted
+                    })
+                    
+                    # Collect supply plan
+                    supply_plan = pd.DataFrame({
+                        'Date': sku.forecast['mean'].index,
+                        'SKU': sku_params['SKU'],
+                        'Forecast Demand': sku.forecast['mean'].values,
+                        'Order Quantity': sku.order_evolution,
+                        'Orders Arriving': sku.orders_arriving,
+                        'Orders in Transit': sku.orders_in_transit,
+                        'Inventory Level': sku.inventory_evolution,
+                        'Stockouts': sku.stockouts
+                    })
+                    
+                    # Optimize memory usage of the supply plan
+                    supply_plan, _ = optimize_dataframe_memory(supply_plan)
+                    batch_supply_plans.append(supply_plan)
+                
+            except Exception as e:
+                skipped_skus['Processing Errors'].append(f"{sku_params['SKU']}: {str(e)}")
                 continue
+        
+        # Combine batch supply plans and add to main list
+        if batch_supply_plans:
+            batch_combined = pd.concat(batch_supply_plans, axis=0)
+            supply_plans.append(batch_combined)
             
-            # Ensure all parameters are numeric
-            params = {
-                'periods': int(periods),
-                'lead_time_weeks': int(sku_params['lead_time_weeks']),
-                'initial_inventory': int(sku_params['initial_inventory']),
-                'service_level': float(sku_params['service_level']),
-                'order_cost': float(sku_params['order_cost']),
-                'holding_cost': float(sku_params['holding_cost']),
-                'cost': float(sku_params['cost']),
-                'price': float(sku_params['price']),
-                'review_period': int(sku_params['review_period']),
-                'stockout_cost': float(sku_params['stockout_cost'])
-            }
-            
-            # Get start time (first sale date)
-            start_time = sku_data['Date'].min()
-            
-            # Run simulation
-            sku = run_inventory_system(
-                sku_data, sku_params['SKU'], params,
-                forecast_model, inventory_model,
-                params['periods'], start_time
-            )
-            
-            if sku is not None:
-                # Update seasonality counter if seasonality was extracted
-                if forecast_model.seasonality_extracted:
-                    st.session_state.seasonality_extracted += 1
-                
-                # Collect results
-                results.append({
-                    'SKU': sku_params['SKU'],
-                    'Service Level': 1 - float(np.mean(sku.stockouts)),
-                    'Average Inventory': float(np.mean(sku.inventory_evolution)),
-                    'Total Cost': float(np.sum(sku.inventory_evolution * params['holding_cost'] + 
-                                       sku.order_evolution * params['cost'])),
-                    'Total Sales': float(np.sum(np.minimum(sku.inventory_evolution, sku.demand_evolution) * 
-                                        params['price'])),
-                    'Stockout Rate': float(np.mean(sku.stockouts)),
-                    'Inventory Turnover': float(np.sum(sku.demand_evolution) / 
-                                        np.mean(sku.inventory_evolution)) if np.mean(sku.inventory_evolution) > 0 else 0,
-                    'EOQ': float(sku.inventory_policy.get('eoq', 0)),
-                    'Reorder Point': float(sku.inventory_policy.get('reorder_point', 0)),
-                    'Safety Stock': float(sku.inventory_policy.get('safety_stock', 0)),
-                    'Seasonality Extracted': forecast_model.seasonality_extracted
-                })
-                
-                # Collect supply plan
-                supply_plan = pd.DataFrame({
-                    'Date': sku.forecast['mean'].index,
-                    'SKU': sku_params['SKU'],
-                    'Forecast Demand': sku.forecast['mean'].values,
-                    'Order Quantity': sku.order_evolution,
-                    'Orders Arriving': sku.orders_arriving,
-                    'Orders in Transit': sku.orders_in_transit,
-                    'Inventory Level': sku.inventory_evolution,
-                    'Stockouts': sku.stockouts
-                })
-                supply_plans.append(supply_plan)
-            
-        except Exception as e:
-            skipped_skus['Processing Errors'].append(f"{sku_params['SKU']}: {str(e)}")
-            continue
+        # Clear memory after each batch
+        import gc
+        gc.collect()
     
     progress_bar.empty()
     status_text.empty()
@@ -250,7 +289,17 @@ def run_multiple_sku_analysis(historic_data, master_data, periods):
         return pd.DataFrame(), pd.DataFrame()
     
     results_df = pd.DataFrame(results)
-    supply_plans_df = pd.concat(supply_plans, axis=0) if supply_plans else pd.DataFrame()
+    
+    # Optimize results dataframe
+    results_df, results_reduction = optimize_dataframe_memory(results_df)
+    
+    # Combine all supply plans
+    if supply_plans:
+        supply_plans_df = pd.concat(supply_plans, axis=0)
+        supply_plans_df, supply_reduction = optimize_dataframe_memory(supply_plans_df)
+        st.info(f"Memory optimization: Results data reduced by {results_reduction:.1f}%, Supply plan data reduced by {supply_reduction:.1f}%")
+    else:
+        supply_plans_df = pd.DataFrame()
     
     return results_df, supply_plans_df
 
@@ -462,9 +511,54 @@ def display_supply_demand_plan(supply_plan_df, results_df):
         filtered_results = results_df[results_df['SKU'] == selected_sku]
         title_suffix = f" - {selected_sku}"
     else:
-        filtered_plan = supply_plan_df
-        filtered_results = results_df
-        title_suffix = " - All SKUs"
+        # When "All SKUs" is selected, limit to a subset of SKUs to prevent memory issues
+        max_skus_to_display = 5  # Limit to 5 SKUs at a time
+        
+        if len(results_df['SKU'].unique()) > max_skus_to_display:
+            # If there are more than max_skus_to_display, add pagination
+            all_skus = sorted(results_df['SKU'].unique())
+            
+            # Add pagination controls
+            col1, col2 = st.columns([3, 1])
+            with col1:
+                page_size = st.selectbox(
+                    "SKUs per page:",
+                    options=[5, 10, 20, 50],
+                    index=0,
+                    key="sku_page_size"
+                )
+            
+            with col2:
+                total_pages = (len(all_skus) + page_size - 1) // page_size
+                page_number = st.number_input(
+                    f"Page (1-{total_pages}):",
+                    min_value=1,
+                    max_value=total_pages,
+                    value=1,
+                    key="sku_page_number"
+                )
+            
+            start_idx = (page_number - 1) * page_size
+            end_idx = min(start_idx + page_size, len(all_skus))
+            
+            selected_skus = all_skus[start_idx:end_idx]
+            st.info(f"Showing SKUs {start_idx+1}-{end_idx} of {len(all_skus)}")
+            
+            filtered_plan = supply_plan_df[supply_plan_df['SKU'].isin(selected_skus)]
+            filtered_results = results_df[results_df['SKU'].isin(selected_skus)]
+            title_suffix = f" - Page {page_number}/{total_pages}"
+        else:
+            filtered_plan = supply_plan_df
+            filtered_results = results_df
+            title_suffix = " - All SKUs"
+    
+    # Check if the filtered data is too large
+    if len(filtered_plan) > 100000:
+        st.warning(f"The selected data contains {len(filtered_plan)} rows, which may cause memory issues. Consider selecting a specific SKU or reducing the date range.")
+        
+        # Sample the data to reduce memory usage
+        filtered_plan = filtered_plan.sample(n=100000, random_state=42)
+        st.info("Data has been sampled to 100,000 rows to improve performance.")
     
     # Aggregate data by date
     daily_plan = filtered_plan.groupby('Date').agg({
@@ -533,7 +627,7 @@ def display_supply_demand_plan(supply_plan_df, results_df):
         ))
     
     # Add Reorder Point and Safety Stock if viewing a single SKU
-    if selected_sku != 'All SKUs':
+    if selected_sku != 'All SKUs' and len(filtered_results) == 1:
         sku_policy = dict(zip(results_df['SKU'], 
                             zip(results_df['EOQ'], 
                                 results_df['Reorder Point'],
@@ -592,10 +686,41 @@ def display_supply_demand_plan(supply_plan_df, results_df):
     
     st.plotly_chart(fig, use_container_width=True)
     
-    # Supply Plan Table
+    # Supply Plan Table with pagination
     st.subheader("Supply Plan Details")
+    
+    # Sort the data
+    sorted_plan = filtered_plan.sort_values('Date')
+    
+    # Add pagination for the table
+    rows_per_page = st.selectbox(
+        "Rows per page:",
+        options=[10, 25, 50, 100],
+        index=1,  # Default to 25
+        key="supply_plan_rows_per_page"
+    )
+    
+    total_pages = (len(sorted_plan) + rows_per_page - 1) // rows_per_page
+    
+    if total_pages > 1:
+        page_number = st.number_input(
+            f"Page (1-{total_pages}):",
+            min_value=1,
+            max_value=total_pages,
+            value=1,
+            key="supply_plan_page_number"
+        )
+        
+        start_idx = (page_number - 1) * rows_per_page
+        end_idx = min(start_idx + rows_per_page, len(sorted_plan))
+        
+        st.info(f"Showing rows {start_idx+1}-{end_idx} of {len(sorted_plan)}")
+        display_plan = sorted_plan.iloc[start_idx:end_idx]
+    else:
+        display_plan = sorted_plan
+    
     st.dataframe(
-        filtered_plan.sort_values('Date').style.format({
+        display_plan.style.format({
             'Forecast Demand': '{:.0f}',
             'Order Quantity': '{:.0f}',
             'Orders Arriving': '{:.0f}',
@@ -719,9 +844,54 @@ def display_weekly_analysis(supply_plan_df, results_df):
         filtered_results = results_df[results_df['SKU'] == selected_sku]
         title_suffix = f" - {selected_sku}"
     else:
-        filtered_plan = supply_plan_df
-        filtered_results = results_df
-        title_suffix = " - All SKUs"
+        # When "All SKUs" is selected, limit to a subset of SKUs to prevent memory issues
+        max_skus_to_display = 5  # Limit to 5 SKUs at a time
+        
+        if len(results_df['SKU'].unique()) > max_skus_to_display:
+            # If there are more than max_skus_to_display, add pagination
+            all_skus = sorted(results_df['SKU'].unique())
+            
+            # Add pagination controls
+            col1, col2 = st.columns([3, 1])
+            with col1:
+                page_size = st.selectbox(
+                    "SKUs per page:",
+                    options=[5, 10, 20, 50],
+                    index=0,
+                    key="weekly_sku_page_size"
+                )
+            
+            with col2:
+                total_pages = (len(all_skus) + page_size - 1) // page_size
+                page_number = st.number_input(
+                    f"Page (1-{total_pages}):",
+                    min_value=1,
+                    max_value=total_pages,
+                    value=1,
+                    key="weekly_sku_page_number"
+                )
+            
+            start_idx = (page_number - 1) * page_size
+            end_idx = min(start_idx + page_size, len(all_skus))
+            
+            selected_skus = all_skus[start_idx:end_idx]
+            st.info(f"Showing SKUs {start_idx+1}-{end_idx} of {len(all_skus)}")
+            
+            filtered_plan = supply_plan_df[supply_plan_df['SKU'].isin(selected_skus)]
+            filtered_results = results_df[results_df['SKU'].isin(selected_skus)]
+            title_suffix = f" - Page {page_number}/{total_pages}"
+        else:
+            filtered_plan = supply_plan_df
+            filtered_results = results_df
+            title_suffix = " - All SKUs"
+    
+    # Check if the filtered data is too large
+    if len(filtered_plan) > 100000:
+        st.warning(f"The selected data contains {len(filtered_plan)} rows, which may cause memory issues. Consider selecting a specific SKU or reducing the date range.")
+        
+        # Sample the data to reduce memory usage
+        filtered_plan = filtered_plan.sample(n=100000, random_state=42)
+        st.info("Data has been sampled to 100,000 rows to improve performance.")
     
     # Create a dictionary of inventory policies for quick lookup
     inventory_policies = dict(zip(results_df['SKU'], 
@@ -807,8 +977,10 @@ def display_weekly_analysis(supply_plan_df, results_df):
             f"{week_data['Stockouts'].sum():,.0f}"
         )
         
-        # Decision support table
+        # Decision support table with pagination
         st.markdown("### Weekly Decisions")
+        
+        # Get the decision table for the selected week
         decision_table = week_data[['SKU', 'Forecast Demand', 'Inventory Level', 
                                   'Stock Coverage (weeks)', 'Order Decision']].copy()
         
@@ -816,6 +988,33 @@ def display_weekly_analysis(supply_plan_df, results_df):
         decision_table['Stock Coverage (weeks)'] = decision_table['Stock Coverage (weeks)'].apply(
             lambda x: f"{x:.1f}" if x < 999 and x > 0 else "N/A" if x == 0 else ">999"
         )
+        
+        # Add pagination if there are many SKUs
+        if len(decision_table) > 10:
+            rows_per_page = st.selectbox(
+                "Rows per page:",
+                options=[5, 10, 20, 50],
+                index=1,  # Default to 10
+                key="weekly_decision_rows_per_page"
+            )
+            
+            total_pages = (len(decision_table) + rows_per_page - 1) // rows_per_page
+            
+            page_number = st.number_input(
+                f"Page (1-{total_pages}):",
+                min_value=1,
+                max_value=total_pages,
+                value=1,
+                key="weekly_decision_page_number"
+            )
+            
+            start_idx = (page_number - 1) * rows_per_page
+            end_idx = min(start_idx + rows_per_page, len(decision_table))
+            
+            st.info(f"Showing rows {start_idx+1}-{end_idx} of {len(decision_table)}")
+            display_table = decision_table.iloc[start_idx:end_idx]
+        else:
+            display_table = decision_table
         
         # Create a style function that only applies to the Order Decision column
         def style_order_decision(row):
@@ -829,7 +1028,7 @@ def display_weekly_analysis(supply_plan_df, results_df):
             return [color_map.get(decision_icon, '')] * len(row)
         
         # Apply styling with number formatting
-        styled_table = decision_table.style\
+        styled_table = display_table.style\
             .format({
                 'Forecast Demand': '{:,.0f}',
                 'Inventory Level': '{:,.0f}'
@@ -838,27 +1037,38 @@ def display_weekly_analysis(supply_plan_df, results_df):
         
         st.dataframe(styled_table, use_container_width=True)
         
-        # Recommendations
+        # Recommendations - limit to critical items only
         st.markdown("### Recommendations")
-        for _, row in decision_table.iterrows():
-            sku_policy = inventory_policies.get(row['SKU'])
-            if sku_policy:
-                eoq, reorder_point, safety_stock = sku_policy
-                if '🔴' in row['Order Decision']:
-                    st.warning(
-                        f"SKU {row['SKU']}: {row['Order Decision']}\n" +
-                        f"- Current Inventory: {row['Inventory Level']:,.0f}\n" +
-                        f"- Reorder Point: {reorder_point:,.0f}\n" +
-                        f"- Safety Stock: {safety_stock:,.0f}"
-                    )
-                elif '🟡' in row['Order Decision']:
-                    st.info(
-                        f"SKU {row['SKU']}: Stock coverage is moderate ({row['Stock Coverage (weeks)']} weeks).\n" +
-                        f"- Current Inventory: {row['Inventory Level']:,.0f}\n" +
-                        f"- Reorder Point: {reorder_point:,.0f}"
-                    )
-                elif '⚠️' in row['Order Decision']:
-                    st.warning(f"SKU {row['SKU']}: Unable to calculate stock coverage. Please check forecast and inventory data.")
+        
+        # Filter to show only critical items (red and yellow)
+        critical_items = display_table[display_table['Order Decision'].str.contains('🔴|🟡|⚠️')]
+        
+        if len(critical_items) > 0:
+            for _, row in critical_items.iterrows():
+                sku_policy = inventory_policies.get(row['SKU'])
+                if sku_policy:
+                    eoq, reorder_point, safety_stock = sku_policy
+                    if '🔴' in row['Order Decision']:
+                        st.warning(
+                            f"SKU {row['SKU']}: {row['Order Decision']}\n" +
+                            f"- Current Inventory: {row['Inventory Level']:,.0f}\n" +
+                            f"- Reorder Point: {reorder_point:,.0f}\n" +
+                            f"- Safety Stock: {safety_stock:,.0f}"
+                        )
+                    elif '🟡' in row['Order Decision']:
+                        st.info(
+                            f"SKU {row['SKU']}: Stock coverage is moderate ({row['Stock Coverage (weeks)']} weeks).\n" +
+                            f"- Current Inventory: {row['Inventory Level']:,.0f}\n" +
+                            f"- Reorder Point: {reorder_point:,.0f}"
+                        )
+                    elif '⚠️' in row['Order Decision']:
+                        st.warning(f"SKU {row['SKU']}: Unable to calculate stock coverage. Please check forecast and inventory data.")
+        else:
+            st.success("No critical items requiring immediate attention for this week.")
+            
+        # Clear memory
+        import gc
+        gc.collect()
 
 def display_syntetos_categorization(historic_data, master_data):
     st.subheader("Syntetos-Boylan Categorization")
@@ -1037,6 +1247,47 @@ def display_syntetos_categorization(historic_data, master_data):
     styled_df = display_df.style.applymap(color_category, subset=['Category'])
     st.dataframe(styled_df, use_container_width=True)
 
+def optimize_dataframe_memory(df):
+    """
+    Optimize memory usage of a DataFrame by downcasting numeric columns
+    and converting object columns to categories when appropriate.
+    """
+    start_mem = df.memory_usage().sum() / 1024**2
+    
+    # Process columns by dtype
+    for col in df.columns:
+        col_type = df[col].dtype
+        
+        # Numeric columns
+        if col_type in ['int64', 'float64']:
+            c_min = df[col].min()
+            c_max = df[col].max()
+            
+            # Integer columns
+            if col_type == 'int64':
+                if c_min > np.iinfo(np.int8).min and c_max < np.iinfo(np.int8).max:
+                    df[col] = df[col].astype(np.int8)
+                elif c_min > np.iinfo(np.int16).min and c_max < np.iinfo(np.int16).max:
+                    df[col] = df[col].astype(np.int16)
+                elif c_min > np.iinfo(np.int32).min and c_max < np.iinfo(np.int32).max:
+                    df[col] = df[col].astype(np.int32)
+            
+            # Float columns
+            elif col_type == 'float64':
+                if c_min > np.finfo(np.float32).min and c_max < np.finfo(np.float32).max:
+                    df[col] = df[col].astype(np.float32)
+        
+        # Object columns (strings)
+        elif col_type == 'object':
+            # Convert to category if less than 50% unique values
+            if df[col].nunique() / len(df) < 0.5:
+                df[col] = df[col].astype('category')
+    
+    end_mem = df.memory_usage().sum() / 1024**2
+    reduction = (start_mem - end_mem) / start_mem * 100
+    
+    return df, reduction
+
 def main():
     # Initialize session state variables
     if 'analysis_run' not in st.session_state:
@@ -1088,8 +1339,31 @@ def main():
                 st.markdown("**Master Data**")
                 st.dataframe(st.session_state.master_data.head(), use_container_width=True)
             
-            # Get forecast periods
-            periods = st.number_input("Forecast Periods (weeks)", min_value=1, value=52)
+            # Analysis parameters
+            st.subheader("Analysis Parameters")
+            
+            col1, col2 = st.columns(2)
+            
+            with col1:
+                # Get forecast periods
+                periods = st.number_input("Forecast Periods (weeks)", min_value=1, value=52)
+            
+            with col2:
+                # Add batch size control
+                total_skus = len(st.session_state.master_data)
+                batch_size = st.slider(
+                    "SKUs per batch (lower for less memory usage)",
+                    min_value=5,
+                    max_value=min(50, total_skus),
+                    value=min(20, total_skus),
+                    step=5,
+                    help="Process SKUs in smaller batches to reduce memory usage. Lower values use less memory but may take longer."
+                )
+            
+            # Memory usage warning
+            if total_skus > 50:
+                st.warning(f"Your dataset contains {total_skus} SKUs, which may require significant memory. "
+                          "If you encounter memory errors, try reducing the batch size.")
             
             # Create a placeholder for warnings
             warnings_placeholder = st.empty()
@@ -1106,7 +1380,8 @@ def main():
                         results_df, supply_plan_df = run_multiple_sku_analysis(
                             st.session_state.historic_data,
                             st.session_state.master_data,
-                            periods
+                            periods,
+                            batch_size
                         )
                     
                     # Store results in session state
