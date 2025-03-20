@@ -75,9 +75,18 @@ def display_logo_and_title():
 @st.cache_data
 def load_data(file):
     try:
-        # Read both sheets
+        # Read all required sheets
         historic_data = pd.read_excel(file, sheet_name="Historic Data")
         master_data = pd.read_excel(file, sheet_name="Master Data")
+        
+        # Try to read Transit Orders sheet (new feature)
+        try:
+            transit_orders = pd.read_excel(file, sheet_name="Transit Orders")
+            has_transit_orders = True
+        except Exception as e:
+            transit_orders = None
+            has_transit_orders = False
+            st.info("Transit Orders sheet not found. The analysis will proceed without transit orders.")
         
         # Validate historic data
         required_historic_cols = ['Date', 'SKU', 'QTY']
@@ -89,6 +98,16 @@ def load_data(file):
                               'order_cost', 'cost', 'price', 'review_period']
         if not all(col in master_data.columns for col in required_master_cols):
             raise ValueError(f"Master Data sheet missing required columns. Required: {required_master_cols}")
+        
+        # Validate transit orders data if present
+        if has_transit_orders:
+            required_transit_cols = ['SKU', 'QTY', 'ARRIVAL_DATE']
+            if not all(col in transit_orders.columns for col in required_transit_cols):
+                raise ValueError(f"Transit Orders sheet missing required columns. Required: {required_transit_cols}")
+            
+            # Process transit orders data
+            transit_orders['ARRIVAL_DATE'] = pd.to_datetime(transit_orders['ARRIVAL_DATE'])
+            transit_orders = transit_orders.sort_values(['SKU', 'ARRIVAL_DATE'])
         
         # Process historic data
         historic_data['Date'] = pd.to_datetime(historic_data['Date'])
@@ -109,13 +128,17 @@ def load_data(file):
         historic_data, hist_reduction = optimize_dataframe_memory(historic_data)
         master_data, master_reduction = optimize_dataframe_memory(master_data)
         
-        st.info(f"Memory optimization: Historic data reduced by {hist_reduction:.1f}%, Master data reduced by {master_reduction:.1f}%")
+        if has_transit_orders:
+            transit_orders, transit_reduction = optimize_dataframe_memory(transit_orders)
+            st.info(f"Memory optimization: Historic data reduced by {hist_reduction:.1f}%, Master data reduced by {master_reduction:.1f}%, Transit Orders reduced by {transit_reduction:.1f}%")
+        else:
+            st.info(f"Memory optimization: Historic data reduced by {hist_reduction:.1f}%, Master data reduced by {master_reduction:.1f}%")
         
-        return historic_data, master_data
+        return historic_data, master_data, transit_orders
     
     except Exception as e:
         st.error(f"Error loading data: {str(e)}")
-        return None, None
+        return None, None, None
 
 def is_sku_suitable_for_optimization(sku):
     """
@@ -156,7 +179,7 @@ def is_sku_suitable_for_optimization(sku):
     
     return True, None
 
-def run_multiple_sku_analysis(historic_data, master_data, periods, batch_size=20, optimization_params=None):
+def run_multiple_sku_analysis(historic_data, master_data, periods, batch_size=20, optimization_params=None, transit_orders=None):
     results = []
     supply_plans = []
     # Reset seasonality counter at the start of each analysis
@@ -275,11 +298,16 @@ def run_multiple_sku_analysis(historic_data, master_data, periods, batch_size=20
                 # Get start time (first sale date)
                 start_time = sku_data['Date'].min()
                 
+                # Filter transit orders for this specific SKU
+                sku_transit_orders = None
+                if transit_orders is not None and not transit_orders.empty:
+                    sku_transit_orders = transit_orders[transit_orders['SKU'] == sku_params['SKU']].copy()
+                
                 # Run simulation
                 sku = run_inventory_system(
                     sku_data, sku_params['SKU'], params,
                     forecast_model, inventory_model,
-                    params['periods'], start_time
+                    params['periods'], start_time, sku_transit_orders
                 )
                 
                 if sku is not None:
@@ -962,11 +990,17 @@ def display_supply_demand_plan(supply_plan_df, results_df):
     else:
         display_plan = sorted_plan
     
+    # Fill NaN values with 0 to prevent IntCastingNaNError
+    for col in ['Forecast Demand', 'Order Quantity', 'Orders Arriving', 'Orders in Transit', 'Inventory Level', 'Stockouts']:
+        if col in display_plan.columns:
+            display_plan[col] = display_plan[col].fillna(0)
+    
     st.dataframe(
         display_plan.style.format({
             'Forecast Demand': '{:.0f}',
             'Order Quantity': '{:.0f}',
             'Orders Arriving': '{:.0f}',
+            'Orders in Transit': '{:.0f}',  # Add transit orders column to formatting
             'Inventory Level': '{:.0f}',
             'Stockouts': '{:.0f}'
         }),
@@ -1562,25 +1596,42 @@ def main():
            ('current_file_hash' not in st.session_state) or \
            (st.session_state.current_file_hash != current_file_hash):
             
-            historic_data, master_data = load_data(uploaded_file)
+            historic_data, master_data, transit_orders = load_data(uploaded_file)
             
             if historic_data is not None and master_data is not None:
                 st.session_state.historic_data = historic_data
                 st.session_state.master_data = master_data
+                st.session_state.transit_orders = transit_orders  # Store transit orders in session state
                 st.session_state.current_file_hash = current_file_hash
                 st.session_state.file_processed = True
                 st.success("File loaded successfully!")
+                
+                # Show info about transit orders if they exist
+                if transit_orders is not None and not transit_orders.empty:
+                    st.info(f"Found {len(transit_orders)} transit orders for {transit_orders['SKU'].nunique()} SKUs.")
         
         if st.session_state.file_processed:
             # Display data preview
             st.subheader("Data Preview")
-            col1, col2 = st.columns(2)
+            
+            # Determine column layout based on transit orders availability
+            if 'transit_orders' in st.session_state and st.session_state.transit_orders is not None and not st.session_state.transit_orders.empty:
+                col1, col2, col3 = st.columns(3)
+            else:
+                col1, col2 = st.columns(2)
+                
             with col1:
                 st.markdown("**Historic Data**")
                 st.dataframe(st.session_state.historic_data.head(), use_container_width=True)
             with col2:
                 st.markdown("**Master Data**")
                 st.dataframe(st.session_state.master_data.head(), use_container_width=True)
+            
+            # Show Transit Orders if available
+            if 'transit_orders' in st.session_state and st.session_state.transit_orders is not None and not st.session_state.transit_orders.empty:
+                with col3:
+                    st.markdown("**Transit Orders**")
+                    st.dataframe(st.session_state.transit_orders.head(), use_container_width=True)
             
             # Analysis parameters
             st.subheader("Analysis Parameters")
@@ -1679,7 +1730,8 @@ def main():
                             st.session_state.master_data,
                             periods,
                             batch_size,
-                            optimization_params
+                            optimization_params,
+                            st.session_state.transit_orders if 'transit_orders' in st.session_state else None
                         )
                     
                     # Store results in session state

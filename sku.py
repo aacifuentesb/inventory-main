@@ -5,7 +5,7 @@ import plotly.graph_objs as go
 from plotly.subplots import make_subplots
 
 class SKU:
-    def __init__(self, sku_id, data, params, forecast_model, inventory_model,periods):
+    def __init__(self, sku_id, data, params, forecast_model, inventory_model, periods, transit_orders=None):
         self.sku_id = sku_id
         self.data = data
         self.params = params
@@ -15,6 +15,7 @@ class SKU:
         self.forecast_model = forecast_model
         self.inventory_model = inventory_model
         self.periods = periods
+        self.transit_orders = transit_orders  # Store transit orders
         if 'review_period' not in self.params:
             self.params['review_period'] = 1  # Default to weekly review if not specified
         self.forecast = None
@@ -37,9 +38,37 @@ class SKU:
         return self.params['cost'] * stockout_cost_percentage
 
     def simulate_inventory(self, demand, periods):
+        # Get base inventory simulation results
         (self.inventory_evolution, self.order_evolution, self.stockouts, 
          self.profit_evolution, self.orders_arriving, self.orders_in_transit, self.unfufilled_demand) = \
             self.inventory_model.simulate(demand, periods, self.params)
+        
+        # If transit orders exist, add them to the orders_arriving array
+        if self.transit_orders is not None and len(self.transit_orders) > 0:
+            # Convert arrival dates to week indices
+            forecast_start_date = self.forecast['mean'].index[0]
+            for _, order in self.transit_orders.iterrows():
+                # Calculate week index by computing weeks between arrival date and forecast start date
+                weeks_diff = (order['ARRIVAL_DATE'] - forecast_start_date).days // 7
+                
+                # Only include orders that will arrive during the forecast period
+                if 0 <= weeks_diff < periods:
+                    self.orders_arriving[weeks_diff] += order['QTY']
+                    
+                    # Recalculate inventory after adding transit orders
+                    for t in range(weeks_diff, periods):
+                        if t == weeks_diff:
+                            # Add incoming order to inventory
+                            self.inventory_evolution[t] += order['QTY']
+                        elif t > 0:
+                            # Propagate the inventory change forward, respecting demand constraints
+                            additional_inventory = min(order['QTY'], self.unfufilled_demand[t-1])
+                            if additional_inventory > 0:
+                                # Reduce unfulfilled demand and stockouts if inventory can now fulfill it
+                                self.unfufilled_demand[t-1] -= additional_inventory
+                                self.stockouts[t-1] = self.unfufilled_demand[t-1] > 0
+                                # Adjust profit from reduced stockouts
+                                self.profit_evolution[t-1] += additional_inventory * self.params['price'] - additional_inventory * self.params['stockout_cost']
         
         self.demand_evolution = demand
         self.order_points = self.order_evolution > 0
@@ -156,7 +185,7 @@ def generate_weekly_time_series(df, sku_id):
     
     return weekly_data
 
-def run_inventory_system(df, sku_id, params, forecast_model, inventory_model, periods, start_time=None):
+def run_inventory_system(df, sku_id, params, forecast_model, inventory_model, periods, start_time=None, transit_orders=None):
     """
     Run inventory system simulation for a SKU
     
@@ -176,6 +205,8 @@ def run_inventory_system(df, sku_id, params, forecast_model, inventory_model, pe
         Number of periods to forecast
     start_time : datetime, optional
         Start time for analysis. If None, uses all available data
+    transit_orders : pd.DataFrame, optional
+        DataFrame containing transit orders data with SKU, QTY, and ARRIVAL_DATE columns
         
     Returns:
     --------
@@ -188,8 +219,13 @@ def run_inventory_system(df, sku_id, params, forecast_model, inventory_model, pe
     
     weekly_data = generate_weekly_time_series(df, sku_id)
     
+    # Filter transit orders for the specific SKU if available
+    sku_transit_orders = None
+    if transit_orders is not None:
+        sku_transit_orders = transit_orders[transit_orders['SKU'] == sku_id].copy()
+    
     # Create SKU object and run simulation
-    sku = SKU(sku_id, weekly_data, params, forecast_model, inventory_model, periods)
+    sku = SKU(sku_id, weekly_data, params, forecast_model, inventory_model, periods, sku_transit_orders)
     sku.generate_forecast(periods)
     sku.calculate_inventory_policy()
     sku.simulate_inventory(sku.forecast['mean'], periods)
