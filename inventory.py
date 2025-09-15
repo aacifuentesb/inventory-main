@@ -144,14 +144,27 @@ class RQContinuousReview(InventoryModel):
                     if t + lead_time < periods:
                         orders_arriving[t + lead_time] += orders[t]
             
+            # FIXED: Correct inventory and stockout calculation
             received_order = orders_arriving[t]
-            inventory[t] = max(0, inventory[t-1] + received_order - demand[t])
+            available_inventory = inventory[t-1] + received_order
             
-            if inventory[t] < demand[t]:
+            # Check for stockouts BEFORE subtracting demand
+            # Convert demand to numeric value to avoid pandas indexing issues
+            current_demand = demand.iloc[t] if hasattr(demand, 'iloc') else demand[t]
+            
+            if available_inventory >= current_demand:
+                # Sufficient inventory
+                sales = current_demand
+                inventory[t] = available_inventory - current_demand
+                stockouts[t] = False
+                unfufilled_demand[t] = 0
+            else:
+                # Stockout situation
+                sales = available_inventory
+                inventory[t] = 0
                 stockouts[t] = True
-                unfufilled_demand[t] = demand[t] - inventory[t]
+                unfufilled_demand[t] = current_demand - available_inventory
             
-            sales = min(inventory[t], demand[t])
             profits[t] = (sales * params['price'] - 
                           orders[t] * params['cost'] - 
                           inventory[t] * params['holding_cost']-
@@ -266,18 +279,31 @@ class SSPeriodicReview(InventoryModel):
                     if t + lead_time < periods:
                         orders_arriving[t + lead_time] += orders[t]
             
+            # FIXED: Correct inventory and stockout calculation
             received_order = orders_arriving[t]
-            inventory[t] = max(0, inventory[t-1] + received_order - demand[t])
+            available_inventory = inventory[t-1] + received_order
             
-            if inventory[t] < demand[t]:
+            # Check for stockouts BEFORE subtracting demand
+            # Convert demand to numeric value to avoid pandas indexing issues
+            current_demand = demand.iloc[t] if hasattr(demand, 'iloc') else demand[t]
+            
+            if available_inventory >= current_demand:
+                # Sufficient inventory
+                sales = current_demand
+                inventory[t] = available_inventory - current_demand
+                stockouts[t] = False
+                unfufilled_demand[t] = 0
+            else:
+                # Stockout situation
+                sales = available_inventory
+                inventory[t] = 0
                 stockouts[t] = True
-                unfufilled_demand[t] = demand[t] - inventory[t]
+                unfufilled_demand[t] = current_demand - available_inventory
             
-            sales = min(inventory[t], demand[t])
             profits[t] = (sales * params['price'] - 
                           orders[t] * params['cost'] - 
                           inventory[t] * params['holding_cost'] - 
-                            unfufilled_demand[t] * params['stockout_cost'])
+                          unfufilled_demand[t] * params['stockout_cost'])
             
             if lead_time > 1:
                 orders_in_transit[t] = sum(orders[max(0, t-lead_time+1):t])
@@ -362,14 +388,27 @@ class BaseStockModel(InventoryModel):
                 if t + lead_time < periods:
                     orders_arriving[t + lead_time] += orders[t]
             
+            # FIXED: Correct inventory and stockout calculation
             received_order = orders_arriving[t]
-            inventory[t] = max(0, inventory[t-1] + received_order - demand[t])
+            available_inventory = inventory[t-1] + received_order
             
-            if inventory[t] < demand[t]:
+            # Check for stockouts BEFORE subtracting demand
+            # Convert demand to numeric value to avoid pandas indexing issues
+            current_demand = demand.iloc[t] if hasattr(demand, 'iloc') else demand[t]
+            
+            if available_inventory >= current_demand:
+                # Sufficient inventory
+                sales = current_demand
+                inventory[t] = available_inventory - current_demand
+                stockouts[t] = False
+                unfufilled_demand[t] = 0
+            else:
+                # Stockout situation
+                sales = available_inventory
+                inventory[t] = 0
                 stockouts[t] = True
-                unfufilled_demand[t] = demand[t] - inventory[t]
+                unfufilled_demand[t] = current_demand - available_inventory
             
-            sales = min(inventory[t], demand[t])
             profits[t] = (sales * params['price'] - 
                           orders[t] * params['cost'] - 
                           inventory[t] * params['holding_cost']
@@ -719,32 +758,37 @@ class ModifiedContinuousReview(InventoryModel):
                 orders_arriving[lead_time] += order_quantity
 
         for t in range(1, periods):
-            # Check for order arrival
-            if t >= lead_time:
-                inventory[t] = inventory[t-1] + orders[t-lead_time]
-            else:
-                inventory[t] = inventory[t-1]
+            # FIXED: Use consistent orders_arriving array for both simulation and display
+            received_order = orders_arriving[t]
+            available_inventory = inventory[t-1] + received_order
             
-            # Handle demand
-            if inventory[t] < demand[t]:
-                stockouts[t] = True
-                sales = inventory[t]
-                inventory[t] = 0
-                unfufilled_demand[t] = demand[t] - sales
+            # Handle demand - check for stockouts BEFORE subtracting demand
+            # Convert demand to numeric value to avoid pandas indexing issues
+            current_demand = demand.iloc[t] if hasattr(demand, 'iloc') else demand[t]
+            
+            if available_inventory >= current_demand:
+                # Sufficient inventory
+                sales = current_demand
+                inventory[t] = available_inventory - current_demand
+                stockouts[t] = False
+                unfufilled_demand[t] = 0
             else:
-                sales = demand[t]
-                inventory[t] -= sales
+                # Stockout situation
+                sales = available_inventory
+                inventory[t] = 0
+                stockouts[t] = True
+                unfufilled_demand[t] = current_demand - available_inventory
             
             # Calculate profits
             profits[t] = (sales * params['price'] - 
-                          (orders[t] if t >= lead_time else 0) * params['cost'] - 
+                          orders[t] * params['cost'] - 
                           inventory[t] * params['holding_cost'] -
                           unfufilled_demand[t] * params['stockout_cost'])
             
             # Check for ordering (only on review periods)
             if t % review_period == 0:
                 inventory_position = (inventory[t] + 
-                                   np.sum(orders[max(0, t-lead_time+1):t]))
+                                   np.sum(orders[max(0, t-lead_time+1):t+1]))
                 
                 if inventory_position <= self.policy['reorder_point']:
                     # Calculate dynamic order quantity
@@ -755,7 +799,7 @@ class ModifiedContinuousReview(InventoryModel):
                         orders_arriving[t + lead_time] += order_quantity
             
             # Update orders in transit
-            orders_in_transit[t] = np.sum(orders[max(0, t-lead_time+1):t])
+            orders_in_transit[t] = np.sum(orders[max(0, t-lead_time+1):t+1])
 
         return inventory, orders, stockouts, profits, orders_arriving, orders_in_transit, unfufilled_demand
 

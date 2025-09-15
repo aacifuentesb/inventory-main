@@ -43,10 +43,11 @@ class SKU:
          self.profit_evolution, self.orders_arriving, self.orders_in_transit, self.unfufilled_demand) = \
             self.inventory_model.simulate(demand, periods, self.params)
         
-        # If transit orders exist, add them to the orders_arriving array
+        # If transit orders exist, add them to the orders_arriving array and recalculate inventory
         if self.transit_orders is not None and len(self.transit_orders) > 0:
-            # Convert arrival dates to week indices
+            # Convert arrival dates to week indices and add to orders_arriving
             forecast_start_date = self.forecast['mean'].index[0]
+            
             for _, order in self.transit_orders.iterrows():
                 # Calculate week index by computing weeks between arrival date and forecast start date
                 weeks_diff = (order['ARRIVAL_DATE'] - forecast_start_date).days // 7
@@ -54,26 +55,68 @@ class SKU:
                 # Only include orders that will arrive during the forecast period
                 if 0 <= weeks_diff < periods:
                     self.orders_arriving[weeks_diff] += order['QTY']
-                    
-                    # Recalculate inventory after adding transit orders
-                    for t in range(weeks_diff, periods):
-                        if t == weeks_diff:
-                            # Add incoming order to inventory
-                            self.inventory_evolution[t] += order['QTY']
-                        elif t > 0:
-                            # Propagate the inventory change forward, respecting demand constraints
-                            additional_inventory = min(order['QTY'], self.unfufilled_demand[t-1])
-                            if additional_inventory > 0:
-                                # Reduce unfulfilled demand and stockouts if inventory can now fulfill it
-                                self.unfufilled_demand[t-1] -= additional_inventory
-                                self.stockouts[t-1] = self.unfufilled_demand[t-1] > 0
-                                # Adjust profit from reduced stockouts
-                                self.profit_evolution[t-1] += additional_inventory * self.params['price'] - additional_inventory * self.params['stockout_cost']
+            
+            # Re-simulate inventory evolution to properly account for transit orders
+            self._recalculate_inventory_with_transit_orders(demand, periods)
         
         self.demand_evolution = demand
         self.order_points = self.order_evolution > 0
         
         self.calculate_metrics()
+
+    def _recalculate_inventory_with_transit_orders(self, demand, periods):
+        """
+        Re-simulate inventory evolution properly accounting for transit orders.
+        This fixes the issue where transit orders appeared in charts but didn't 
+        affect actual inventory calculations.
+        """
+        # Find periods where transit orders arrive by checking which periods have transit orders
+        transit_periods = []
+        if self.transit_orders is not None:
+            forecast_start_date = self.forecast['mean'].index[0]
+            for _, order in self.transit_orders.iterrows():
+                weeks_diff = (order['ARRIVAL_DATE'] - forecast_start_date).days // 7
+                if 0 <= weeks_diff < periods:
+                    transit_periods.append(weeks_diff)
+        
+        if not transit_periods:
+            return  # No transit orders to process
+        
+        # Re-simulate from the first transit order arrival period
+        start_period = min(transit_periods)
+        
+        for t in range(start_period, periods):
+            if t == 0:
+                # Period 0: Use initial inventory + any arriving orders
+                available_inventory = self.params['initial_inventory'] + self.orders_arriving[t]
+            else:
+                # Subsequent periods: Previous inventory + arriving orders
+                available_inventory = self.inventory_evolution[t-1] + self.orders_arriving[t]
+            
+            # Handle demand fulfillment (same logic as fixed inventory models)
+            # Convert demand to numeric value to avoid pandas indexing issues
+            current_demand = demand.iloc[t] if hasattr(demand, 'iloc') else demand[t]
+            
+            if available_inventory >= current_demand:
+                # Sufficient inventory
+                sales = current_demand
+                self.inventory_evolution[t] = available_inventory - current_demand
+                self.stockouts[t] = False
+                self.unfufilled_demand[t] = 0
+            else:
+                # Stockout situation  
+                sales = available_inventory
+                self.inventory_evolution[t] = 0
+                self.stockouts[t] = True
+                self.unfufilled_demand[t] = current_demand - available_inventory
+            
+            # Recalculate profits for this period
+            self.profit_evolution[t] = (
+                sales * self.params['price'] - 
+                self.order_evolution[t] * self.params['cost'] - 
+                self.inventory_evolution[t] * self.params['holding_cost'] -
+                self.unfufilled_demand[t] * self.params.get('stockout_cost', 0)
+            )
 
     def update_inventory_policy(self, new_policy):
         if self.inventory_policy == new_policy:
